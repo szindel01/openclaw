@@ -1,20 +1,17 @@
-import { execFile } from "node:child_process";
+// Imessage plugin module implements media staging behavior.
 import fs from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
-import { isInboundPathAllowed } from "openclaw/plugin-sdk/media-runtime";
+import type { ChannelInboundMediaInput } from "openclaw/plugin-sdk/channel-inbound";
+import { isInboundPathAllowed, kindFromMime } from "openclaw/plugin-sdk/media-runtime";
 import { saveMediaBuffer } from "openclaw/plugin-sdk/media-store";
-import { buildRandomTempFilePath } from "openclaw/plugin-sdk/temp-path";
+import { loadWebMedia } from "openclaw/plugin-sdk/web-media";
 import type { IMessageAttachment } from "./types.js";
 
-const execFileAsync = promisify(execFile);
+type StagedIMessageAttachment = ChannelInboundMediaInput;
 
-const HEIC_CONVERSION_TIMEOUT_MS = 15_000;
-const HEIC_CONVERSION_MAX_BUFFER_BYTES = 64 * 1024;
-
-export type StagedIMessageAttachment = {
-  path: string;
-  contentType?: string;
+type StagedIMessageAttachments = {
+  attachments: StagedIMessageAttachment[];
+  unavailableCount: number;
 };
 
 type SaveMediaBufferImpl = typeof saveMediaBuffer;
@@ -24,6 +21,13 @@ type StageIMessageAttachmentsDeps = {
   convertHeicToJpeg?: (sourcePath: string, maxBytes: number) => Promise<Buffer>;
   logVerbose?: (message: string) => void;
 };
+
+function createTypeOnlyIMessageAttachment(
+  attachment: IMessageAttachment,
+): StagedIMessageAttachment {
+  const contentType = attachment.mime_type?.trim() || undefined;
+  return { contentType, kind: kindFromMime(contentType) ?? "unknown" };
+}
 
 function isHeicAttachment(attachmentPath: string, mimeType?: string | null): boolean {
   const normalizedMime = mimeType?.toLowerCase();
@@ -73,43 +77,6 @@ async function resolveAllowedCanonicalAttachmentPath(params: {
   return canonicalPath;
 }
 
-async function convertHeicToJpegWithSips(sourcePath: string, maxBytes: number): Promise<Buffer> {
-  const tempPath = buildRandomTempFilePath({
-    prefix: "openclaw-imessage",
-    extension: "jpg",
-  });
-  try {
-    await execFileAsync(
-      "sips",
-      [
-        "-s",
-        "format",
-        "jpeg",
-        "-s",
-        "formatOptions",
-        "90",
-        "-Z",
-        "4096",
-        sourcePath,
-        "--out",
-        tempPath,
-      ],
-      {
-        timeout: HEIC_CONVERSION_TIMEOUT_MS,
-        maxBuffer: HEIC_CONVERSION_MAX_BUFFER_BYTES,
-        killSignal: "SIGKILL",
-      },
-    );
-    const stat = await fs.stat(tempPath);
-    if (stat.size > maxBytes) {
-      throw new Error(`converted media exceeds ${Math.round(maxBytes / (1024 * 1024))}MB limit`);
-    }
-    return await fs.readFile(tempPath);
-  } finally {
-    await fs.rm(tempPath, { force: true }).catch(() => {});
-  }
-}
-
 async function readAttachmentBuffer(params: {
   attachmentPath: string;
   mimeType?: string | null;
@@ -142,11 +109,20 @@ async function readAttachmentBuffer(params: {
 
   if (isHeicAttachment(params.attachmentPath, params.mimeType)) {
     try {
-      const convert = params.deps.convertHeicToJpeg ?? convertHeicToJpegWithSips;
+      const convert = params.deps.convertHeicToJpeg;
+      const converted = convert
+        ? {
+            buffer: await convert(canonicalPath, params.maxBytes),
+            fileName: jpegFilenameForAttachment(params.attachmentPath),
+          }
+        : await loadWebMedia(canonicalPath, {
+            maxBytes: params.maxBytes,
+            localRoots: [path.dirname(canonicalPath)],
+          });
       return {
-        buffer: await convert(canonicalPath, params.maxBytes),
+        buffer: converted.buffer,
         contentType: "image/jpeg",
-        originalFilename: jpegFilenameForAttachment(params.attachmentPath),
+        originalFilename: converted.fileName ?? jpegFilenameForAttachment(params.attachmentPath),
       };
     } catch (err) {
       params.deps.logVerbose?.(
@@ -169,14 +145,17 @@ export async function stageIMessageAttachments(
     allowedRoots?: readonly string[];
     deps?: StageIMessageAttachmentsDeps;
   },
-): Promise<StagedIMessageAttachment[]> {
+): Promise<StagedIMessageAttachments> {
   const deps = params.deps ?? {};
   const save = deps.saveMediaBuffer ?? saveMediaBuffer;
   const staged: StagedIMessageAttachment[] = [];
+  let unavailableCount = 0;
 
   for (const attachment of attachments) {
     const attachmentPath = attachment.original_path?.trim();
     if (!attachmentPath || attachment.missing) {
+      unavailableCount += 1;
+      staged.push(createTypeOnlyIMessageAttachment(attachment));
       continue;
     }
 
@@ -195,11 +174,18 @@ export async function stageIMessageAttachments(
         params.maxBytes,
         media.originalFilename,
       );
-      staged.push({ path: saved.path, contentType: saved.contentType });
+      const contentType = saved.contentType ?? media.contentType;
+      staged.push({
+        path: saved.path,
+        contentType,
+        kind: kindFromMime(contentType) ?? "unknown",
+      });
     } catch (err) {
+      unavailableCount += 1;
+      staged.push(createTypeOnlyIMessageAttachment(attachment));
       deps.logVerbose?.(`imessage: failed to stage inbound attachment: ${String(err)}`);
     }
   }
 
-  return staged;
+  return { attachments: staged, unavailableCount };
 }

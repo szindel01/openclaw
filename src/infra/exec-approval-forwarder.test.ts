@@ -1,14 +1,29 @@
+// Covers exec approval forwarding to channel plugins.
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReplyPayload } from "../auto-reply/types.js";
-import type { ChannelPlugin } from "../channels/plugins/types.js";
+import type { ChannelPlugin } from "../channels/plugins/types.public.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
 import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
-import {
-  buildExecApprovalRequestMessage,
-  createExecApprovalForwarder,
-} from "./exec-approval-forwarder.js";
+import { createExecApprovalForwarder } from "./exec-approval-forwarder.js";
 import type { ExecApprovalRequest } from "./exec-approvals.js";
+
+const { mockLogError } = vi.hoisted(() => ({ mockLogError: vi.fn() }));
+vi.mock("../logging/subsystem.js", () => ({
+  createSubsystemLogger: () => ({
+    subsystem: "gateway/exec-approvals",
+    isEnabled: () => false,
+    trace: vi.fn(),
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: mockLogError,
+    fatal: vi.fn(),
+    raw: vi.fn(),
+    child: vi.fn(),
+  }),
+}));
 
 const baseRequest = {
   id: "req-1",
@@ -96,7 +111,7 @@ function buildTelegramExecApprovalPendingPayloadForTest(params: {
 }): ReplyPayload {
   return {
     text: `Telegram exec approval ${params.request.id}`,
-    interactive: {
+    presentation: {
       blocks: [
         {
           type: "buttons",
@@ -245,12 +260,9 @@ const TARGETS_CFG = makeTargetsCfg([{ channel: "slack", to: "U123" }]);
 function createForwarder(params: {
   cfg: OpenClawConfig;
   deliver?: ReturnType<typeof vi.fn>;
-  resolveSessionTarget?: () => {
-    channel: string;
-    to: string;
-    accountId?: string;
-    threadId?: string | number;
-  } | null;
+  resolveSessionTarget?: NonNullable<
+    NonNullable<Parameters<typeof createExecApprovalForwarder>[0]>["resolveSessionTarget"]
+  >;
 }) {
   const deliver = params.deliver ?? vi.fn().mockResolvedValue([]);
   const deps: NonNullable<Parameters<typeof createExecApprovalForwarder>[0]> = {
@@ -512,7 +524,40 @@ describe("exec approval forwarder", () => {
     expect(deliver).not.toHaveBeenCalled();
   });
 
-  it("attaches shared interactive approval buttons in forwarded fallback payloads", async () => {
+  it.each(["webchat", "tui"])(
+    "preserves configured session fallback for %s-originated exec approvals",
+    async (turnSourceChannel) => {
+      const resolveSessionTarget = vi.fn(async ({ request }) =>
+        request.request.turnSourceChannel
+          ? null
+          : { channel: "telegram" as const, to: "123", accountId: "default" },
+      );
+      const cfg = {
+        approvals: { exec: { enabled: true, mode: "session" } },
+      } as OpenClawConfig;
+      const { deliver, forwarder } = createForwarder({ cfg, resolveSessionTarget });
+
+      await expect(
+        forwarder.handleRequested({
+          ...baseRequest,
+          request: {
+            ...baseRequest.request,
+            turnSourceChannel,
+          },
+        }),
+      ).resolves.toBe(true);
+      expect(resolveSessionTarget).toHaveBeenCalledWith(
+        expect.objectContaining({
+          request: expect.objectContaining({
+            request: expect.objectContaining({ turnSourceChannel: null }),
+          }),
+        }),
+      );
+      expect(deliver).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("attaches shared presentation approval buttons in forwarded fallback payloads", async () => {
     vi.useFakeTimers();
     const { deliver, forwarder } = createForwarder({
       cfg: makeTargetsCfg([{ channel: "telegram", to: "123" }]),
@@ -535,7 +580,7 @@ describe("exec approval forwarder", () => {
     expect(delivery.to).toBe("123");
     const payload = requireFirstPayload(deliver);
     expect(payload.channelData?.execApproval).toEqual({ approvalId: "req-1" });
-    expect(payload.interactive).toEqual({
+    expect(payload.presentation).toEqual({
       blocks: [
         {
           type: "buttons",
@@ -559,6 +604,7 @@ describe("exec approval forwarder", () => {
         },
       ],
     });
+    expect(payload.interactive).toBeUndefined();
   });
 
   it("stores exec metadata on generic forwarded fallback payloads", async () => {
@@ -585,27 +631,7 @@ describe("exec approval forwarder", () => {
     expect(text).toContain("🔒 Exec approval required");
     expect(text).toContain("Command: `echo hello`");
     expect(text).toContain("Expires in: 5s");
-    expect(text).toContain("Reply with: /approve <id> allow-once|allow-always|deny");
-  });
-
-  it("includes command analysis warnings in fallback delivery text", () => {
-    const text = buildExecApprovalRequestMessage(
-      {
-        ...baseRequest,
-        request: {
-          ...baseRequest.request,
-          commandAnalysis: {
-            commandCount: 1,
-            nestedCommandCount: 0,
-            riskKinds: ["inline-eval"],
-            warningLines: ["Contains inline-eval: python3 -c"],
-          },
-        },
-      },
-      1000,
-    );
-    expect(text).toContain("Command analysis:");
-    expect(text).toContain("- Contains inline-eval: python3 -c");
+    expect(text).toContain("Reply with: /approve req-1 allow-once|allow-always|deny");
   });
 
   it("omits allow-always from forwarded fallback text when ask=always", async () => {
@@ -622,7 +648,7 @@ describe("exec approval forwarder", () => {
     ).resolves.toBe(true);
     await Promise.resolve();
     const text = getFirstDeliveryText(deliver);
-    expect(text).toContain("Reply with: /approve <id> allow-once|deny");
+    expect(text).toContain("Reply with: /approve req-1 allow-once|deny");
     expect(text).not.toContain("allow-once|allow-always|deny");
     expect(text).toContain("Allow Always is unavailable");
   });
@@ -702,5 +728,110 @@ describe("exec approval forwarder", () => {
     });
 
     expect(deliver).toHaveBeenCalledTimes(1);
+  });
+
+  describe("expiry delivery error handling (#83106)", () => {
+    afterEach(() => {
+      mockLogError.mockClear();
+    });
+
+    it("logs per-target error when expiry delivery fails without producing unhandled rejection", async () => {
+      vi.useFakeTimers();
+      const deliver = vi.fn().mockResolvedValue([]);
+      const { forwarder } = createForwarder({ cfg: TARGETS_CFG, deliver });
+
+      await expect(forwarder.handleRequested(baseRequest)).resolves.toBe(true);
+      await flushPendingDelivery();
+
+      // Make the expiry delivery throw — deliverToTargets catches this
+      // per-target and logs it, preventing an unhandled rejection.
+      deliver.mockRejectedValue(new Error("channel delivery crashed"));
+
+      // Trigger expiry
+      await vi.advanceTimersByTimeAsync(baseRequest.expiresAtMs - 1000);
+      await flushPendingDelivery();
+
+      // deliverToTargets catches per-target errors and logs them
+      expect(mockLogError).toHaveBeenCalledWith(expect.stringContaining("failed to deliver"));
+      expect(mockLogError).toHaveBeenCalledWith(
+        expect.stringContaining("channel delivery crashed"),
+      );
+    });
+
+    it("cleans up pending entry after successful expiry delivery", async () => {
+      vi.useFakeTimers();
+      const { deliver, forwarder } = createForwarder({ cfg: TARGETS_CFG });
+
+      await expect(forwarder.handleRequested(baseRequest)).resolves.toBe(true);
+      await flushPendingDelivery();
+      deliver.mockClear();
+
+      // Trigger expiry
+      await vi.advanceTimersByTimeAsync(baseRequest.expiresAtMs - 1000);
+      await flushPendingDelivery();
+
+      expect(deliver).toHaveBeenCalledTimes(1);
+      const expiryText =
+        (
+          expectDefined(deliver.mock.calls[0], "deliver.mock.calls[0] test invariant")[0] as {
+            payloads?: Array<{ text?: string }>;
+          }
+        ).payloads?.[0]?.text ?? "";
+      expect(expiryText).toContain("expired");
+
+      // After expiry, the pending entry should be cleaned up.
+      deliver.mockClear();
+      await forwarder.handleResolved({
+        id: baseRequest.id,
+        decision: "allow-once",
+        resolvedBy: "slack:U123",
+        ts: 7000,
+      });
+      // No delivery because pending entry was already deleted before delivery
+      expect(deliver).not.toHaveBeenCalled();
+    });
+
+    it("deletes pending entry before starting expiry delivery", async () => {
+      vi.useFakeTimers();
+      let pendingDeletedDuringDelivery = false;
+
+      const deliver = vi
+        .fn()
+        .mockImplementation(async (deliveryParams: { payloads?: Array<{ text?: string }> }) => {
+          const text = deliveryParams.payloads?.[0]?.text ?? "";
+          if (text.includes("expired")) {
+            // During expiry delivery, try to resolve the same request.
+            // If pending.delete happened before delivery, handleResolved
+            // will not find the entry and will not deliver a resolved notice.
+            await forwarder.handleResolved({
+              id: baseRequest.id,
+              decision: "allow-once",
+              resolvedBy: "slack:U123",
+              ts: 7000,
+            });
+            // handleResolved returns void, but if it tried to deliver,
+            // deliver would be called again. We track that below.
+            pendingDeletedDuringDelivery = true;
+          }
+          return [];
+        });
+
+      const { forwarder } = createForwarder({ cfg: TARGETS_CFG, deliver });
+      await expect(forwarder.handleRequested(baseRequest)).resolves.toBe(true);
+      await flushPendingDelivery();
+      deliver.mockClear();
+
+      // Trigger expiry
+      await vi.advanceTimersByTimeAsync(baseRequest.expiresAtMs - 1000);
+      for (let i = 0; i < 5; i += 1) {
+        await flushPendingDelivery();
+      }
+
+      expect(pendingDeletedDuringDelivery).toBe(true);
+      // Only 1 delivery call (the expiry notification itself).
+      // handleResolved during delivery found no pending entry because
+      // pending.delete ran before deliverToTargets, so no resolved notice.
+      expect(deliver).toHaveBeenCalledTimes(1);
+    });
   });
 });

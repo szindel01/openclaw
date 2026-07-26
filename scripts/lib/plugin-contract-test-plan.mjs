@@ -1,50 +1,15 @@
-import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+// Builds balanced Vitest shard plans for plugin contract tests.
+import { listTrackedTestFiles } from "./list-test-files.mjs";
 
 function listContractTestFiles(rootDir = "src/plugins/contracts") {
-  const result = spawnSync("git", ["ls-files", "--", rootDir], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-  if (result.status === 0) {
-    return result.stdout
-      .split("\n")
-      .map((line) => line.trim().replaceAll("\\", "/"))
-      .filter((line) => line.endsWith(".test.ts"))
-      .toSorted((a, b) => a.localeCompare(b));
-  }
-
-  if (!existsSync(rootDir)) {
-    return [];
-  }
-
-  const files = [];
-  const visit = (dir) => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const path = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        visit(path);
-        continue;
-      }
-      if (entry.isFile() && entry.name.endsWith(".test.ts")) {
-        files.push(path.replaceAll("\\", "/"));
-      }
-    }
-  };
-
-  visit(rootDir);
-  return files.toSorted((a, b) => a.localeCompare(b));
+  return listTrackedTestFiles(rootDir);
 }
 
 const CONTRACT_FILE_WEIGHTS = new Map([
   ["plugin-sdk-subpaths.test.ts", 80],
-  ["plugin-sdk-root-alias.test.ts", 90],
   ["tts.contract.test.ts", 70],
   ["boundary-invariants.test.ts", 36],
   ["extension-package-project-boundaries.test.ts", 34],
-  ["plugin-sdk-index.test.ts", 32],
-  ["plugin-sdk-index.bundle.test.ts", 32],
   ["plugin-sdk-package-contract-guardrails.test.ts", 46],
   ["providers.contract.test.ts", 30],
   ["registry.contract.test.ts", 30],
@@ -65,8 +30,9 @@ function resolveContractFileWeight(file) {
   return CONTRACT_FILE_WEIGHTS.get(name) ?? 10;
 }
 
+/** Create balanced plugin contract test shards for CI check planning. */
 export function createPluginContractTestShards() {
-  const suffixes = ["a", "b", "c", "d"];
+  const suffixes = ["a", "b"];
   const groups = Object.fromEntries(
     suffixes.map((suffix) => [`checks-fast-contracts-plugins-${suffix}`, []]),
   );

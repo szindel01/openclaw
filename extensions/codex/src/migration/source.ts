@@ -1,5 +1,4 @@
-import type { Dirent } from "node:fs";
-import fs from "node:fs/promises";
+// Codex plugin module implements source behavior.
 import path from "node:path";
 import {
   defaultCodexAppInventoryCache,
@@ -14,62 +13,19 @@ import {
 } from "../app-server/plugin-inventory.js";
 import type { CodexGetAccountResponse, v2 } from "../app-server/protocol.js";
 import { requestCodexAppServerJson } from "../app-server/request.js";
+import { exists, isDirectory, resolveHomePath, resolveUserHomeDir } from "./helpers.js";
 import {
-  exists,
-  isDirectory,
-  readJsonObject,
-  resolveHomePath,
-  resolveUserHomeDir,
-} from "./helpers.js";
+  discoverCodexMemorySources,
+  discoverPluginDirs,
+  discoverSkillDirs,
+  type CodexMemorySource,
+  type CodexPluginMigrationAppFact,
+  type CodexPluginMigrationBlockCode,
+  type CodexPluginSource,
+  type CodexSkillSource,
+} from "./source-files.js";
 
-const SKILL_FILENAME = "SKILL.md";
-const MAX_SCAN_DEPTH = 6;
-const MAX_DISCOVERED_DIRS = 2000;
-
-export type CodexSkillSource = {
-  name: string;
-  source: string;
-  sourceLabel: string;
-};
-
-export type CodexPluginSource = {
-  name: string;
-  source: string;
-  sourceKind: "app-server" | "cache";
-  migratable: boolean;
-  manifestPath?: string;
-  marketplaceName?: typeof CODEX_PLUGINS_MARKETPLACE_NAME;
-  pluginName?: string;
-  installed?: boolean;
-  enabled?: boolean;
-  apps?: CodexPluginMigrationAppFact[];
-  migrationBlock?: CodexPluginMigrationBlock;
-  message?: string;
-};
-
-export type CodexPluginMigrationBlockCode =
-  | "plugin_disabled"
-  | "codex_subscription_required"
-  | "codex_account_unavailable"
-  | "plugin_read_unavailable"
-  | "app_inventory_unavailable"
-  | "app_inaccessible"
-  | "app_disabled"
-  | "app_missing";
-
-export type CodexPluginMigrationAppFact = {
-  id: string;
-  name: string;
-  needsAuth?: boolean;
-  isAccessible?: boolean;
-  isEnabled?: boolean;
-};
-
-export type CodexPluginMigrationBlock = {
-  code: CodexPluginMigrationBlockCode;
-  apps?: CodexPluginMigrationAppFact[];
-  error?: string;
-};
+export type { CodexPluginSource } from "./source-files.js";
 
 type CodexArchiveSource = {
   id: string;
@@ -78,14 +34,15 @@ type CodexArchiveSource = {
   message?: string;
 };
 
-type CodexSource = {
+export type CodexSource = {
   root: string;
   confidence: "low" | "medium" | "high";
   codexHome: string;
   codexSkillsDir?: string;
   personalAgentsSkillsDir?: string;
-  configPath?: string;
-  hooksPath?: string;
+  authPath?: string;
+  modelsCachePath?: string;
+  memoryFiles: CodexMemorySource[];
   skills: CodexSkillSource[];
   plugins: CodexPluginSource[];
   pluginDiscoveryError?: string;
@@ -94,6 +51,7 @@ type CodexSource = {
 
 type CodexSourceDiscoveryOptions = {
   input?: string;
+  memoryOnly?: boolean;
   evaluatePluginMigrationEligibility?: boolean;
   verifyPluginApps?: boolean;
 };
@@ -113,84 +71,15 @@ type PluginReadResult =
     };
 
 function defaultCodexHome(): string {
-  return resolveHomePath(process.env.CODEX_HOME?.trim() || "~/.codex");
+  const configuredHome = process.env.CODEX_HOME;
+  // Codex preserves nonempty CODEX_HOME verbatim; --from remains trimmed below as CLI convenience.
+  return resolveHomePath(
+    configuredHome !== undefined && configuredHome.length > 0 ? configuredHome : "~/.codex",
+  );
 }
 
 function personalAgentsSkillsDir(): string {
   return path.join(resolveUserHomeDir(), ".agents", "skills");
-}
-
-async function safeReadDir(dir: string): Promise<Dirent[]> {
-  return await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
-}
-
-async function discoverSkillDirs(params: {
-  root: string | undefined;
-  sourceLabel: string;
-  excludeSystem?: boolean;
-}): Promise<CodexSkillSource[]> {
-  if (!params.root || !(await isDirectory(params.root))) {
-    return [];
-  }
-  const discovered: CodexSkillSource[] = [];
-  async function visit(dir: string, depth: number): Promise<void> {
-    if (discovered.length >= MAX_DISCOVERED_DIRS || depth > MAX_SCAN_DEPTH) {
-      return;
-    }
-    const name = path.basename(dir);
-    if (params.excludeSystem && depth === 1 && name === ".system") {
-      return;
-    }
-    if (await exists(path.join(dir, SKILL_FILENAME))) {
-      discovered.push({ name, source: dir, sourceLabel: params.sourceLabel });
-      return;
-    }
-    for (const entry of await safeReadDir(dir)) {
-      if (!entry.isDirectory()) {
-        continue;
-      }
-      await visit(path.join(dir, entry.name), depth + 1);
-    }
-  }
-  await visit(params.root, 0);
-  return discovered;
-}
-
-async function discoverPluginDirs(codexHome: string): Promise<CodexPluginSource[]> {
-  const root = path.join(codexHome, "plugins", "cache");
-  if (!(await isDirectory(root))) {
-    return [];
-  }
-  const discovered = new Map<string, CodexPluginSource>();
-  async function visit(dir: string, depth: number): Promise<void> {
-    if (discovered.size >= MAX_DISCOVERED_DIRS || depth > MAX_SCAN_DEPTH) {
-      return;
-    }
-    const manifestPath = path.join(dir, ".codex-plugin", "plugin.json");
-    if (await exists(manifestPath)) {
-      const manifest = await readJsonObject(manifestPath);
-      const manifestName = typeof manifest.name === "string" ? manifest.name.trim() : "";
-      const name = manifestName || path.basename(dir);
-      discovered.set(dir, {
-        name,
-        source: dir,
-        manifestPath,
-        sourceKind: "cache",
-        migratable: false,
-        message:
-          "Cached Codex plugin bundle found. Review manually unless the plugin is also installed in the source Codex app-server inventory",
-      });
-      return;
-    }
-    for (const entry of await safeReadDir(dir)) {
-      if (!entry.isDirectory()) {
-        continue;
-      }
-      await visit(path.join(dir, entry.name), depth + 1);
-    }
-  }
-  await visit(root, 0);
-  return [...discovered.values()].toSorted((a, b) => a.source.localeCompare(b.source));
 }
 
 async function discoverInstalledCuratedPlugins(
@@ -246,6 +135,7 @@ function sourceCodexAppServerStartOptions(codexHome: string): CodexAppServerStar
     transport: "stdio",
     command: "codex",
     commandSource: "managed",
+    managedCommandOrder: "desktop-first",
     args: ["app-server", "--listen", "stdio://"],
     headers: {},
     env: {
@@ -282,7 +172,6 @@ function buildInstalledPluginSource(plugin: v2.PluginSummary): CodexPluginSource
     pluginName,
     marketplaceName: CODEX_PLUGINS_MARKETPLACE_NAME,
     source: `${CODEX_PLUGINS_MARKETPLACE_NAME}/${pluginName}`,
-    sourceKind: "app-server",
     migratable: true,
     installed: plugin.installed,
     enabled: plugin.enabled,
@@ -386,22 +275,24 @@ async function withPluginMigrationEligibility(params: {
     return evaluated;
   }
 
-  const snapshot = await refreshSourceAppInventory(params.requestOptions).catch((error) => {
-    const message = error instanceof Error ? error.message : String(error);
-    for (const { plugin, apps } of pending) {
-      evaluated.push({
-        ...plugin,
-        migratable: false,
-        migrationBlock: {
-          code: "app_inventory_unavailable",
-          apps,
-          error: message,
-        },
-        message: `Codex plugin "${plugin.pluginName ?? plugin.name}" owns apps, but source app inventory could not be read: ${message}`,
-      });
-    }
-    return undefined;
-  });
+  const snapshot = await refreshSourceAppInventory(params.requestOptions).catch(
+    (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      for (const { plugin, apps } of pending) {
+        evaluated.push({
+          ...plugin,
+          migratable: false,
+          migrationBlock: {
+            code: "app_inventory_unavailable",
+            apps,
+            error: message,
+          },
+          message: `Codex plugin "${plugin.pluginName ?? plugin.name}" owns apps, but source app inventory could not be read: ${message}`,
+        });
+      }
+      return undefined;
+    },
+  );
   if (!snapshot) {
     return evaluated;
   }
@@ -563,41 +454,48 @@ function pluginNameFromSummary(summary: v2.PluginSummary): string | undefined {
 }
 
 export async function discoverCodexSource(
-  inputOrOptions?: string | CodexSourceDiscoveryOptions,
+  options: CodexSourceDiscoveryOptions = {},
 ): Promise<CodexSource> {
-  const options =
-    typeof inputOrOptions === "string" || inputOrOptions === undefined
-      ? { input: inputOrOptions }
-      : inputOrOptions;
   const codexHome = resolveHomePath(options.input?.trim() || defaultCodexHome());
   const codexSkillsDir = path.join(codexHome, "skills");
   const agentsSkillsDir = personalAgentsSkillsDir();
   const configPath = path.join(codexHome, "config.toml");
+  const authPath = path.join(codexHome, "auth.json");
+  const modelsCachePath = path.join(codexHome, "models_cache.json");
   const hooksPath = path.join(codexHome, "hooks", "hooks.json");
-  const codexSkills = await discoverSkillDirs({
-    root: codexSkillsDir,
-    sourceLabel: "Codex skill",
-    excludeSystem: true,
-  });
-  const personalAgentSkills = await discoverSkillDirs({
-    root: agentsSkillsDir,
-    sourceLabel: "personal AgentSkill",
-  });
-  const sourcePluginDiscovery = await discoverInstalledCuratedPlugins(codexHome, options);
+  const memoryFiles = await discoverCodexMemorySources(codexHome);
+  const codexSkills = options.memoryOnly
+    ? []
+    : await discoverSkillDirs({
+        root: codexSkillsDir,
+        sourceLabel: "Codex skill",
+        excludeSystem: true,
+      });
+  const personalAgentSkills = options.memoryOnly
+    ? []
+    : await discoverSkillDirs({
+        root: agentsSkillsDir,
+        sourceLabel: "personal AgentSkill",
+      });
+  const sourcePluginDiscovery: { plugins: CodexPluginSource[]; error?: string } = options.memoryOnly
+    ? { plugins: [] }
+    : await discoverInstalledCuratedPlugins(codexHome, options);
   const sourcePluginNames = new Set(
     sourcePluginDiscovery.plugins.flatMap((plugin) =>
       plugin.pluginName ? [plugin.pluginName] : [],
     ),
   );
-  const cachedPlugins = (await discoverPluginDirs(codexHome)).filter((plugin) => {
-    const normalizedName = sanitizePluginName(plugin.name);
-    return !sourcePluginNames.has(normalizedName);
-  });
+  const cachedPlugins = (options.memoryOnly ? [] : await discoverPluginDirs(codexHome)).filter(
+    (plugin) => {
+      const normalizedName = sanitizePluginName(plugin.name);
+      return !sourcePluginNames.has(normalizedName);
+    },
+  );
   const plugins = [...sourcePluginDiscovery.plugins, ...cachedPlugins].toSorted((a, b) =>
     a.source.localeCompare(b.source),
   );
   const archivePaths: CodexArchiveSource[] = [];
-  if (await exists(configPath)) {
+  if (!options.memoryOnly && (await exists(configPath))) {
     archivePaths.push({
       id: "archive:config.toml",
       path: configPath,
@@ -605,7 +503,7 @@ export async function discoverCodexSource(
       message: "Codex config is archived for manual review; it is not activated automatically",
     });
   }
-  if (await exists(hooksPath)) {
+  if (!options.memoryOnly && (await exists(hooksPath))) {
     archivePaths.push({
       id: "archive:hooks/hooks.json",
       path: hooksPath,
@@ -617,7 +515,10 @@ export async function discoverCodexSource(
   const skills = [...codexSkills, ...personalAgentSkills].toSorted((a, b) =>
     a.source.localeCompare(b.source),
   );
-  const high = Boolean(codexSkills.length || plugins.length || archivePaths.length);
+  const hasAuth = !options.memoryOnly && (await exists(authPath));
+  const high = Boolean(
+    memoryFiles.length || codexSkills.length || plugins.length || archivePaths.length || hasAuth,
+  );
   const medium = personalAgentSkills.length > 0;
   return {
     root: codexHome,
@@ -625,8 +526,9 @@ export async function discoverCodexSource(
     codexHome,
     ...((await isDirectory(codexSkillsDir)) ? { codexSkillsDir } : {}),
     ...((await isDirectory(agentsSkillsDir)) ? { personalAgentsSkillsDir: agentsSkillsDir } : {}),
-    ...((await exists(configPath)) ? { configPath } : {}),
-    ...((await exists(hooksPath)) ? { hooksPath } : {}),
+    ...(hasAuth ? { authPath } : {}),
+    ...((await exists(modelsCachePath)) ? { modelsCachePath } : {}),
+    memoryFiles,
     skills,
     plugins,
     ...(sourcePluginDiscovery.error ? { pluginDiscoveryError: sourcePluginDiscovery.error } : {}),

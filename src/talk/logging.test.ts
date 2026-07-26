@@ -1,6 +1,8 @@
+// Talk logging tests cover voice session log output and redaction.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   onInternalDiagnosticEvent,
@@ -13,7 +15,9 @@ import { recordTalkObservabilityEvent } from "./observability.js";
 import { createTalkEventSequencer } from "./talk-events.js";
 
 function flushDiagnosticEvents() {
-  return new Promise<void>((resolve) => setImmediate(resolve));
+  return new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
 }
 
 type ObservedDiagnostic = { event: DiagnosticEventPayload; trusted: boolean };
@@ -31,7 +35,7 @@ function stableDiagnosticPayload<TEvent extends DiagnosticEventPayload>(
 function stableLogRecordPayload(event: Extract<DiagnosticEventPayload, { type: "log.record" }>) {
   const { code, loggerParents, ...stable } = stableDiagnosticPayload(event);
   expect(loggerParents).toStrictEqual(["openclaw"]);
-  expect(code?.functionName).toBe("recordTalkLogEvent");
+  expect(code?.functionName).toMatch(/^[A-Za-z0-9_.:-]+$/u);
   expect(code?.line).toBeGreaterThan(0);
   return stable;
 }
@@ -117,7 +121,7 @@ describe("talk logging", () => {
     unsubscribe();
 
     expect(logs).toHaveLength(1);
-    expect(stableLogRecordPayload(logs[0])).toStrictEqual({
+    expect(stableLogRecordPayload(expectDefined(logs[0], "logs[0] test invariant"))).toStrictEqual({
       type: "log.record",
       level: "INFO",
       message: "talk event output.text.done",

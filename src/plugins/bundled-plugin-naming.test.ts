@@ -1,7 +1,11 @@
+// Verifies bundled plugin naming conventions and package metadata.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { expectDefined } from "@openclaw/normalization-core";
+import { describe, expect, it } from "vitest";
+import { expectNoReaddirSyncDuring } from "../test-utils/fs-scan-assertions.js";
+import { listGitTrackedFiles, toRepoRelativePath } from "../test-utils/repo-files.js";
 
 type PluginManifestShape = {
   id?: unknown;
@@ -32,7 +36,7 @@ const DIR_ID_EXCEPTIONS = new Map<string, string>([
   // Historical directory name kept until a wider repo cleanup is worth the churn.
   ["kimi-coding", "kimi"],
 ]);
-const NON_PACKAGED_BUNDLED_PLUGIN_DIRS = new Set(["qa-channel", "qa-lab", "qa-matrix"]);
+const NON_PACKAGED_BUNDLED_PLUGIN_DIRS = new Set(["qa-channel", "qa-lab"]);
 const ALLOWED_PACKAGE_SUFFIXES = [
   "",
   "-provider",
@@ -42,9 +46,8 @@ const ALLOWED_PACKAGE_SUFFIXES = [
   "-media-understanding",
 ] as const;
 
-// oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- Test helper lets assertions ascribe JSON file shape.
-function readJsonFile<T>(filePath: string): T {
-  return JSON.parse(fs.readFileSync(filePath, "utf8")) as T;
+function readJsonFile(filePath: string): unknown {
+  return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
 
 function normalizeText(value: unknown): string | undefined {
@@ -64,9 +67,7 @@ function listBundledPluginDirs(): string[] {
 }
 
 function listExternalBundledPluginDirs(): string[] | null {
-  const files =
-    listGitPluginMetadataFiles() ??
-    listFindPluginMetadataFiles();
+  const files = listGitPluginMetadataFiles() ?? listFindPluginMetadataFiles();
   if (!files) {
     return null;
   }
@@ -78,38 +79,25 @@ function listExternalBundledPluginDirs(): string[] | null {
       continue;
     }
     const [, dirName, fileName] = match;
-    const metadataFiles = metadataByDir.get(dirName) ?? new Set<string>();
-    metadataFiles.add(fileName);
-    metadataByDir.set(dirName, metadataFiles);
+    const metadataFiles =
+      metadataByDir.get(expectDefined(dirName, "dirName test invariant")) ?? new Set<string>();
+    metadataFiles.add(expectDefined(fileName, "fileName test invariant"));
+    metadataByDir.set(expectDefined(dirName, "dirName test invariant"), metadataFiles);
   }
 
   return [...metadataByDir.entries()]
-    .filter(([, metadataFiles]) =>
-      metadataFiles.has("package.json") && metadataFiles.has("openclaw.plugin.json"),
+    .filter(
+      ([, metadataFiles]) =>
+        metadataFiles.has("package.json") && metadataFiles.has("openclaw.plugin.json"),
     )
     .map(([dirName]) => dirName)
     .toSorted();
 }
 
 function listGitPluginMetadataFiles(): string[] | null {
-  const result = spawnSync(
-    "git",
-    ["ls-files", "--", "extensions/*/package.json", "extensions/*/openclaw.plugin.json"],
-    {
-      cwd: process.cwd(),
-      encoding: "utf8",
-      maxBuffer: 1024 * 1024,
-      stdio: ["ignore", "pipe", "ignore"],
-    },
-  );
-  if (result.status !== 0) {
-    return null;
-  }
-  return result.stdout
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .toSorted();
+  return listGitTrackedFiles({
+    pathspecs: ["extensions/*/package.json", "extensions/*/openclaw.plugin.json"],
+  });
 }
 
 function listFindPluginMetadataFiles(): string[] | null {
@@ -143,38 +131,37 @@ function listFindPluginMetadataFiles(): string[] | null {
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
-    .map((file) => path.relative(process.cwd(), file).split(path.sep).join("/"))
+    .map((file) => toRepoRelativePath(process.cwd(), file))
     .toSorted();
 }
 
 function readBundledPluginRecords(): BundledPluginRecord[] {
-  return listBundledPluginDirs()
-    .flatMap((dirName) => {
-      const rootDir = path.join(EXTENSIONS_ROOT, dirName);
-      const packagePath = path.join(rootDir, "package.json");
-      const manifestPath = path.join(rootDir, "openclaw.plugin.json");
-      if (!fs.existsSync(packagePath) || !fs.existsSync(manifestPath)) {
-        return [];
-      }
+  return listBundledPluginDirs().flatMap((dirName) => {
+    const rootDir = path.join(EXTENSIONS_ROOT, dirName);
+    const packagePath = path.join(rootDir, "package.json");
+    const manifestPath = path.join(rootDir, "openclaw.plugin.json");
+    if (!fs.existsSync(packagePath) || !fs.existsSync(manifestPath)) {
+      return [];
+    }
 
-      const manifest = readJsonFile<PluginManifestShape>(manifestPath);
-      const pkg = readJsonFile<OpenClawPackageShape>(packagePath);
-      const manifestId = normalizeText(manifest.id);
-      const packageName = normalizeText(pkg.name);
-      if (!manifestId || !packageName) {
-        return [];
-      }
+    const manifest = readJsonFile(manifestPath) as PluginManifestShape;
+    const pkg = readJsonFile(packagePath) as OpenClawPackageShape;
+    const manifestId = normalizeText(manifest.id);
+    const packageName = normalizeText(pkg.name);
+    if (!manifestId || !packageName) {
+      return [];
+    }
 
-      return [
-        {
-          dirName,
-          packageName,
-          manifestId,
-          installNpmSpec: normalizeText(pkg.openclaw?.install?.npmSpec),
-          channelId: normalizeText(pkg.openclaw?.channel?.id),
-        },
-      ];
-    });
+    return [
+      {
+        dirName,
+        packageName,
+        manifestId,
+        installNpmSpec: normalizeText(pkg.openclaw?.install?.npmSpec),
+        channelId: normalizeText(pkg.openclaw?.channel?.id),
+      },
+    ];
+  });
 }
 
 function resolveAllowedPackageNamesForId(pluginId: string): string[] {
@@ -200,16 +187,12 @@ function expectNoBundledPluginNamingMismatches(params: {
 
 describe("bundled plugin naming guardrails", () => {
   it("lists bundled plugin metadata without scanning extension directories in-process", () => {
-    const readDir = vi.spyOn(fs, "readdirSync");
-    try {
+    expectNoReaddirSyncDuring(() => {
       const records = readBundledPluginRecords();
 
       expect(records.length).toBeGreaterThan(0);
       expect(records.every((record) => record.dirName.length > 0)).toBe(true);
-      expect(readDir).not.toHaveBeenCalled();
-    } finally {
-      readDir.mockRestore();
-    }
+    });
   });
 
   it.each([

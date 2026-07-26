@@ -1,3 +1,4 @@
+// Lmstudio tests cover setup plugin behavior.
 import { CUSTOM_LOCAL_AUTH_MARKER } from "openclaw/plugin-sdk/provider-auth";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/provider-auth";
 import type { ModelDefinitionConfig } from "openclaw/plugin-sdk/provider-model-shared";
@@ -11,11 +12,14 @@ import type { WizardPrompter } from "openclaw/plugin-sdk/setup";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   LMSTUDIO_DEFAULT_API_KEY_ENV_VAR,
+  LMSTUDIO_DEFAULT_INFERENCE_BASE_URL,
+  LMSTUDIO_DOCKER_HOST_INFERENCE_BASE_URL,
   LMSTUDIO_LOCAL_API_KEY_PLACEHOLDER,
 } from "./defaults.js";
 import {
   configureLmstudioNonInteractive,
   discoverLmstudioProvider,
+  prepareAppGuidedLmstudioSetup,
   promptAndConfigureLmstudioInteractive,
 } from "./setup.js";
 
@@ -179,6 +183,54 @@ function createQueuedWizardPrompterHarness(textValues: string[]): {
   return { prompter, note, text };
 }
 
+function createMethodBoundWizardPrompterHarness(textValues: string[]): {
+  prompter: WizardPrompter;
+  note: ReturnType<typeof vi.fn>;
+  text: ReturnType<typeof vi.fn>;
+} {
+  const queue = [...textValues];
+  const note = vi.fn(async (_message: string, _title?: string) => {});
+  const text = vi.fn(async () => queue.shift() ?? "");
+
+  class MethodBoundWizardPrompter implements WizardPrompter {
+    async intro() {}
+    async outro() {}
+    async note(message: string, title?: string) {
+      await this.recordNote(message, title);
+    }
+    async select<T>(params: { options: Array<{ value: T }> }) {
+      const firstOption = params.options[0];
+      if (!firstOption) {
+        throw new Error("select called without options");
+      }
+      return firstOption.value;
+    }
+    async multiselect() {
+      return [];
+    }
+    async text() {
+      return await this.readText();
+    }
+    async confirm() {
+      return false;
+    }
+    progress() {
+      return {
+        update: () => {},
+        stop: () => {},
+      };
+    }
+    private async readText() {
+      return await text();
+    }
+    private async recordNote(message: string, title?: string) {
+      await note(message, title);
+    }
+  }
+
+  return { prompter: new MethodBoundWizardPrompter(), note, text };
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -296,6 +348,137 @@ describe("lmstudio setup", () => {
     );
   });
 
+  it("prepares an existing tool-capable LLM without a credential profile", async () => {
+    fetchLmstudioModelsMock.mockResolvedValue({
+      reachable: true,
+      status: 200,
+      models: [
+        { type: "embedding", key: "nomic-embed" },
+        { type: "llm", key: "chat-only", display_name: "Chat only" },
+        {
+          type: "llm",
+          key: "qwen3-8b-instruct",
+          display_name: "Qwen3 8B",
+          max_context_length: 65536,
+          capabilities: { trained_for_tool_use: true },
+        },
+      ],
+    });
+
+    const result = await prepareAppGuidedLmstudioSetup({ config: {}, env: {} });
+
+    expect(result).toMatchObject({
+      profiles: [],
+      defaultModel: "lmstudio/qwen3-8b-instruct",
+      configPatch: {
+        models: {
+          mode: "merge",
+          providers: {
+            lmstudio: {
+              baseUrl: LMSTUDIO_DEFAULT_INFERENCE_BASE_URL,
+              api: "openai-completions",
+              models: [
+                expect.objectContaining({ id: "chat-only" }),
+                expect.objectContaining({ id: "qwen3-8b-instruct" }),
+              ],
+            },
+          },
+        },
+      },
+    });
+    expect(result?.configPatch?.models?.providers?.lmstudio?.apiKey).toBe(
+      LMSTUDIO_LOCAL_API_KEY_PLACEHOLDER,
+    );
+    await expect(
+      prepareAppGuidedLmstudioSetup({
+        config: {},
+        env: {},
+        modelRef: "lmstudio/chat-only",
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      prepareAppGuidedLmstudioSetup({
+        config: {},
+        env: {},
+        modelRef: "lmstudio/not-installed",
+      }),
+    ).resolves.toBeNull();
+  });
+
+  it("prefers the strongest tool-calling family among installed models", async () => {
+    fetchLmstudioModelsMock.mockResolvedValue({
+      reachable: true,
+      status: 200,
+      models: [
+        {
+          type: "llm",
+          key: "llama3.3-70b-instruct",
+          max_context_length: 65_536,
+          capabilities: { trained_for_tool_use: true },
+        },
+        {
+          type: "llm",
+          key: "qwen3.5-4b-instruct",
+          max_context_length: 65_536,
+          capabilities: { trained_for_tool_use: true },
+        },
+        {
+          type: "llm",
+          key: "nomic-embed-text",
+          max_context_length: 65_536,
+          capabilities: { trained_for_tool_use: true },
+        },
+      ],
+    });
+
+    const result = await prepareAppGuidedLmstudioSetup({ config: {}, env: {} });
+
+    expect(result?.defaultModel).toBe("lmstudio/qwen3.5-4b-instruct");
+  });
+
+  it("skips a preferred model loaded with less than 16k context", async () => {
+    fetchLmstudioModelsMock.mockResolvedValue({
+      reachable: true,
+      status: 200,
+      models: [
+        {
+          type: "llm",
+          key: "llama3.3-70b-instruct",
+          max_context_length: 65_536,
+          loaded_instances: [{ id: "llama", config: { context_length: 32_768 } }],
+          capabilities: { trained_for_tool_use: true },
+        },
+        {
+          type: "llm",
+          key: "qwen3.5-4b-instruct",
+          max_context_length: 65_536,
+          loaded_instances: [{ id: "qwen", config: { context_length: 8_192 } }],
+          capabilities: { trained_for_tool_use: true },
+        },
+      ],
+    });
+
+    const result = await prepareAppGuidedLmstudioSetup({ config: {}, env: {} });
+
+    expect(result?.defaultModel).toBe("lmstudio/llama3.3-70b-instruct");
+  });
+
+  it("does not auto-detect a model without measured or advertised context", async () => {
+    fetchLmstudioModelsMock.mockResolvedValue({
+      reachable: true,
+      status: 200,
+      models: [
+        {
+          type: "llm",
+          key: "qwen3.5-4b-instruct",
+          capabilities: { trained_for_tool_use: true },
+        },
+      ],
+    });
+
+    await expect(prepareAppGuidedLmstudioSetup({ config: {}, env: {} })).resolves.toBeNull();
+  });
+
   it("non-interactive setup discovers catalog and writes LM Studio provider config", async () => {
     const ctx = buildNonInteractiveContext({
       customBaseUrl: "http://localhost:1234/api/v1/",
@@ -378,7 +561,7 @@ describe("lmstudio setup", () => {
     });
   });
 
-  it("non-interactive setup auto-selects a discovered LM Studio model when none is provided", async () => {
+  it("non-interactive setup selects the preferred discovered model when none is provided", async () => {
     const ctx = buildNonInteractiveContext({
       customBaseUrl: "http://localhost:1234/api/v1/",
     });
@@ -407,9 +590,11 @@ describe("lmstudio setup", () => {
     );
     const setupCtx = requireRecord(setupCall.ctx, "self-hosted setup context");
     expectRecordFields(setupCtx.opts, "self-hosted setup opts", {
-      customModelId: "phi-4",
+      customModelId: "qwen3-8b-instruct",
     });
-    expect(resolveAgentModelPrimaryValue(result?.agents?.defaults?.model)).toBe("lmstudio/phi-4");
+    expect(resolveAgentModelPrimaryValue(result?.agents?.defaults?.model)).toBe(
+      "lmstudio/qwen3-8b-instruct",
+    );
     const models = requireProviderModels(requireNonInteractiveLmstudioProvider(result));
     expect(models).toHaveLength(2);
     expectModelFields(models[0], {
@@ -702,11 +887,17 @@ describe("lmstudio setup", () => {
     const ctx = buildNonInteractiveContext({
       customModelId: "missing-model",
     });
+    const dockerSetup = ["1", "true", "yes", "on"].includes(
+      process.env.OPENCLAW_DOCKER_SETUP?.trim().toLowerCase() ?? "",
+    );
+    const expectedBaseUrl = dockerSetup
+      ? LMSTUDIO_DOCKER_HOST_INFERENCE_BASE_URL
+      : LMSTUDIO_DEFAULT_INFERENCE_BASE_URL;
 
     await expect(configureLmstudioNonInteractive(ctx)).resolves.toBeNull();
 
     expect(ctx.runtime.error).toHaveBeenCalledWith(
-      "LM Studio model missing-model was not found at http://localhost:1234/v1.\nAvailable models: qwen3-8b-instruct",
+      `LM Studio model missing-model was not found at ${expectedBaseUrl}.\nAvailable models: qwen3-8b-instruct`,
     );
     expect(ctx.runtime.exit).toHaveBeenCalledWith(1);
     expect(configureSelfHostedNonInteractiveMock).not.toHaveBeenCalled();
@@ -787,6 +978,43 @@ describe("lmstudio setup", () => {
       contextTokens: 4096,
       maxTokens: 4096,
     });
+  });
+
+  it("interactive setup preserves gateway wizard prompter method binding", async () => {
+    const { prompter, text } = createMethodBoundWizardPrompterHarness([
+      "http://localhost:1234/api/v1/",
+      "lmstudio-test-key",
+      "4096",
+    ]);
+
+    const result = await promptAndConfigureLmstudioInteractive({
+      config: buildConfig(),
+      prompter,
+    });
+
+    expect(text).toHaveBeenCalledTimes(3);
+    expect(result.defaultModel).toBe("lmstudio/qwen3-8b-instruct");
+  });
+
+  it("interactive setup preserves gateway wizard note binding on discovery failure", async () => {
+    fetchLmstudioModelsMock.mockResolvedValueOnce({ reachable: false, models: [] });
+    const { prompter, note, text } = createMethodBoundWizardPrompterHarness([
+      "http://localhost:1234/api/v1/",
+      "lmstudio-test-key",
+    ]);
+
+    await expect(
+      promptAndConfigureLmstudioInteractive({
+        config: buildConfig(),
+        prompter,
+      }),
+    ).rejects.toThrow("LM Studio not reachable");
+
+    expect(text).toHaveBeenCalledTimes(2);
+    expect(note).toHaveBeenCalledWith(
+      "LM Studio could not be reached at http://localhost:1234/v1.\nStart LM Studio (or run lms server start) and re-run setup.",
+      "LM Studio",
+    );
   });
 
   it("interactive setup accepts a blank API key for unauthenticated local LM Studio", async () => {
@@ -1134,6 +1362,20 @@ describe("lmstudio setup", () => {
       },
     },
     {
+      name: "ignores unresolved apiKey template when Authorization header is configured",
+      providerPatch: {
+        apiKey: "${LMSTUDIO_API_KEY}",
+        headers: {
+          Authorization: "Bearer custom-token",
+        },
+      },
+      expectedProviderPatch: {
+        headers: {
+          Authorization: "Bearer custom-token",
+        },
+      },
+    },
+    {
       name: "still injects lmstudio-local when only non-auth headers are configured",
       providerPatch: {
         headers: {
@@ -1344,6 +1586,38 @@ describe("lmstudio setup", () => {
     });
   });
 
+  it("discoverLmstudioProvider ignores an unresolved apiKey template when discoveryApiKey is resolved", async () => {
+    discoverLmstudioModelsMock.mockResolvedValueOnce([
+      createModel("qwen3-8b-instruct", "Qwen3 8B"),
+    ]);
+
+    await discoverLmstudioProvider(
+      buildDiscoveryContext({
+        discoveryApiKey: "resolved-discovery-key",
+        config: {
+          models: {
+            providers: {
+              lmstudio: {
+                baseUrl: "http://localhost:1234/v1",
+                api: "openai-completions",
+                apiKey: "${LMSTUDIO_API_KEY}",
+                models: [],
+              },
+            },
+          },
+        } as OpenClawConfig,
+        env: {},
+      }),
+    );
+
+    expect(discoverLmstudioModelsMock).toHaveBeenCalledWith({
+      baseUrl: "http://localhost:1234/v1",
+      apiKey: "resolved-discovery-key",
+      headers: undefined,
+      quiet: false,
+    });
+  });
+
   it("discoverLmstudioProvider suppresses stale discovery apiKey when Authorization header auth is configured", async () => {
     discoverLmstudioModelsMock.mockResolvedValueOnce([
       createModel("qwen3-8b-instruct", "Qwen3 8B"),
@@ -1487,3 +1761,4 @@ describe("lmstudio setup", () => {
     });
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

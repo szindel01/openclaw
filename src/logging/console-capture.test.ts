@@ -1,5 +1,8 @@
+// Console capture tests cover intercepting and restoring console output.
+import fs from "node:fs";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { setVerbose } from "../global-state.js";
+import { logWarn } from "../logger.js";
 import {
   enableConsoleCapture,
   resetLogger,
@@ -136,6 +139,17 @@ describe("enableConsoleCapture", () => {
     expect(stdoutWrite).toHaveBeenCalledWith('{\n  "ok": true\n}\n');
   });
 
+  it("routes subsystem-prefixed warnings through one file-log sink", () => {
+    const logPath = tempLogPath();
+    setLoggerOverride({ level: "info", file: logPath });
+    enableConsoleCapture();
+
+    logWarn("mcp-loopback: conflicting schema definitions");
+
+    const content = fs.readFileSync(logPath, "utf-8");
+    expect(countMatchingLines(content, "conflicting schema definitions")).toBe(1);
+  });
+
   it("redacts credentials before forwarding console output", () => {
     setLoggerOverride({ level: "info", file: tempLogPath() });
     const log = vi.fn();
@@ -183,12 +197,37 @@ describe("enableConsoleCapture", () => {
   it.each([
     { name: "stdout", stream: process.stdout },
     { name: "stderr", stream: process.stderr },
-  ])("swallows async EPIPE on $name", ({ stream }) => {
-    setLoggerOverride({ level: "info", file: tempLogPath() });
-    enableConsoleCapture();
-    const epipe = new Error("write EPIPE") as NodeJS.ErrnoException;
-    epipe.code = "EPIPE";
-    expect(stream.emit("error", epipe)).toBe(true);
+  ])("exits on async EPIPE on $name", ({ stream }) => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {}) as typeof process.exit);
+    try {
+      setLoggerOverride({ level: "info", file: tempLogPath() });
+      loggingState.streamErrorHandlersInstalled = false;
+      enableConsoleCapture();
+      const epipe = new Error("write EPIPE") as NodeJS.ErrnoException;
+      epipe.code = "EPIPE";
+      stream.emit("error", epipe);
+      expect(exitSpy).toHaveBeenCalledWith(0);
+    } finally {
+      exitSpy.mockRestore();
+    }
+  });
+
+  it("preserves an existing nonzero exit code on async EPIPE", () => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {}) as typeof process.exit);
+    const originalExitCode = process.exitCode;
+    try {
+      process.exitCode = 2;
+      setLoggerOverride({ level: "info", file: tempLogPath() });
+      loggingState.streamErrorHandlersInstalled = false;
+      enableConsoleCapture();
+      const epipe = new Error("write EPIPE") as NodeJS.ErrnoException;
+      epipe.code = "EPIPE";
+      process.stderr.emit("error", epipe);
+      expect(exitSpy).toHaveBeenCalledWith(2);
+    } finally {
+      process.exitCode = originalExitCode;
+      exitSpy.mockRestore();
+    }
   });
 
   it("rethrows non-EPIPE errors on stdout", () => {
@@ -217,6 +256,10 @@ describe("enableConsoleCapture", () => {
 
 function tempLogPath() {
   return logPathTracker.nextPath();
+}
+
+function countMatchingLines(value: string, needle: string): number {
+  return value.split(/\r?\n/u).filter((line) => line.includes(needle)).length;
 }
 
 function eioError() {

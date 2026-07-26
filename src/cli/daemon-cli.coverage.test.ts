@@ -1,9 +1,10 @@
+// Daemon CLI coverage tests cover daemon command branches and output behavior.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { captureEnv } from "../test-utils/env.js";
+import { captureEnv, deleteTestEnvValue, setTestEnvValue } from "../test-utils/env.js";
 import { registerDaemonCli } from "./daemon-cli/register.js";
 
 const probeGatewayStatus = vi.fn(async (..._args: unknown[]) => ({ ok: true }));
@@ -13,6 +14,7 @@ const resolveGatewayProgramArguments = vi.fn(async (_opts?: unknown) => ({
 const serviceInstall = vi.fn().mockResolvedValue(undefined);
 const serviceStage = vi.fn().mockResolvedValue(undefined);
 const serviceUninstall = vi.fn().mockResolvedValue(undefined);
+const serviceStart = vi.fn().mockResolvedValue(undefined);
 const serviceStop = vi.fn().mockResolvedValue(undefined);
 const serviceRestart = vi.fn().mockResolvedValue({ outcome: "completed" });
 const serviceIsLoaded = vi.fn().mockResolvedValue(false);
@@ -27,6 +29,10 @@ const inspectPortUsage = vi.fn(async (port: number) => ({
   status: "free",
   listeners: [],
   hints: [],
+}));
+const inspectPortConnections = vi.fn(async (port: number) => ({
+  port,
+  connections: [],
 }));
 
 function collectMatching<T, U>(
@@ -95,6 +101,7 @@ vi.mock("../daemon/service.js", async () => {
       stage: serviceStage,
       install: serviceInstall,
       uninstall: serviceUninstall,
+      start: serviceStart,
       stop: serviceStop,
       restart: serviceRestart,
       isLoaded: serviceIsLoaded,
@@ -114,6 +121,7 @@ vi.mock("../daemon/inspect.js", () => ({
 }));
 
 vi.mock("../infra/ports.js", () => ({
+  inspectPortConnections: (port: number) => inspectPortConnections(port),
   inspectPortUsage: (port: number) => inspectPortUsage(port),
   formatPortDiagnostics: () => ["Port 18789 is already in use."],
 }));
@@ -185,13 +193,14 @@ describe("daemon-cli coverage", () => {
       "OPENCLAW_GATEWAY_PORT",
       "OPENCLAW_PROFILE",
     ]);
-    process.env.OPENCLAW_STATE_DIR = tmpDir;
-    process.env.OPENCLAW_CONFIG_PATH = path.join(tmpDir, "openclaw.json");
-    delete process.env.OPENCLAW_GATEWAY_PORT;
-    delete process.env.OPENCLAW_PROFILE;
+    setTestEnvValue("OPENCLAW_STATE_DIR", tmpDir);
+    setTestEnvValue("OPENCLAW_CONFIG_PATH", path.join(tmpDir, "openclaw.json"));
+    deleteTestEnvValue("OPENCLAW_GATEWAY_PORT");
+    deleteTestEnvValue("OPENCLAW_PROFILE");
     serviceReadCommand.mockResolvedValue(null);
     resolveGatewayProbeAuthSafeWithSecretInputs.mockClear();
     findExtraGatewayServices.mockClear();
+    inspectPortConnections.mockClear();
     buildGatewayInstallPlan.mockClear();
   });
 
@@ -238,13 +247,14 @@ describe("daemon-cli coverage", () => {
     expect(inspectPortUsage).toHaveBeenCalledWith(19001);
 
     const parsed = parseFirstJsonRuntimeLine<{
-      gateway?: { port?: number; portSource?: string; probeUrl?: string };
+      gateway?: { port?: number; portSource?: string; probeUrl?: string; version?: string | null };
       config?: { mismatch?: boolean };
       rpc?: { url?: string; ok?: boolean };
     }>();
     expect(parsed.gateway?.port).toBe(19001);
     expect(parsed.gateway?.portSource).toBe("service args");
     expect(parsed.gateway?.probeUrl).toBe("ws://127.0.0.1:19001");
+    expect(parsed.gateway?.version).toBeNull();
     expect(parsed.config?.mismatch).toBe(true);
     expect(parsed.rpc?.url).toBe("ws://127.0.0.1:19001");
     expect(parsed.rpc?.ok).toBe(true);
@@ -339,14 +349,15 @@ describe("daemon-cli coverage", () => {
 
   it("starts and stops daemon (json output)", async () => {
     runtimeLogs.length = 0;
-    serviceRestart.mockClear();
+    serviceStart.mockClear();
     serviceStop.mockClear();
     serviceIsLoaded.mockResolvedValue(true);
+    serviceReadRuntime.mockResolvedValueOnce({ status: "stopped" });
 
     await runDaemonCommand(["daemon", "start", "--json"]);
-    await runDaemonCommand(["daemon", "stop", "--json"]);
+    await runDaemonCommand(["daemon", "stop", "--json", "--force"]);
 
-    expect(serviceRestart).toHaveBeenCalledTimes(1);
+    expect(serviceStart).toHaveBeenCalledTimes(1);
     expect(serviceStop).toHaveBeenCalledTimes(1);
     const jsonLines = runtimeLogs.filter((line) => line.trim().startsWith("{"));
     const parsed = jsonLines.map((line) => JSON.parse(line) as { action?: string; ok?: boolean });

@@ -1,5 +1,6 @@
+// Zalouser plugin module implements channel behavior.
 import { createChatChannelPlugin } from "openclaw/plugin-sdk/channel-core";
-import { createAccountStatusSink } from "openclaw/plugin-sdk/channel-lifecycle";
+import { createAccountStatusSink } from "openclaw/plugin-sdk/channel-outbound";
 import { buildPassiveProbedChannelStatusSummary } from "openclaw/plugin-sdk/extension-shared";
 import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
 import {
@@ -28,7 +29,11 @@ import {
 } from "./channel.adapters.js";
 import { listZalouserDirectoryGroupMembers } from "./directory.js";
 import type { ZalouserProbeResult } from "./probe.js";
-import { createZalouserSetupWizardProxy, zalouserSetupAdapter } from "./setup-core.js";
+import {
+  createZalouserSetupWizardProxy,
+  zalouserSetupAdapter,
+  zalouserSetupContract,
+} from "./setup-core.js";
 import { createZalouserPluginBase } from "./shared.js";
 import { collectZalouserStatusIssues } from "./status-issues.js";
 
@@ -71,6 +76,7 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount, ZalouserProb
       ...createZalouserPluginBase({
         setupWizard: zalouserSetupWizardProxy,
         setup: zalouserSetupAdapter,
+        setupContract: zalouserSetupContract,
       }),
       groups: zalouserGroupsAdapter,
       actions: zalouserMessageActions,
@@ -78,7 +84,7 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount, ZalouserProb
       directory: {
         self: async ({ cfg, accountId }) => {
           const { getZaloUserInfo } = await loadZalouserChannelRuntime();
-          const account = resolveZalouserAccountSync({ cfg: cfg, accountId });
+          const account = resolveZalouserAccountSync({ cfg, accountId });
           const parsed = await getZaloUserInfo(account.profile);
           if (!parsed?.userId) {
             return null;
@@ -92,7 +98,7 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount, ZalouserProb
         },
         listPeers: async ({ cfg, accountId, query, limit }) => {
           const { listZaloFriendsMatching } = await loadZalouserChannelRuntime();
-          const account = resolveZalouserAccountSync({ cfg: cfg, accountId });
+          const account = resolveZalouserAccountSync({ cfg, accountId });
           const friends = await listZaloFriendsMatching(account.profile, query);
           const rows = friends.map((friend) =>
             mapUser({
@@ -106,7 +112,7 @@ export const zalouserPlugin: ChannelPlugin<ResolvedZalouserAccount, ZalouserProb
         },
         listGroups: async ({ cfg, accountId, query, limit }) => {
           const { listZaloGroupsMatching } = await loadZalouserChannelRuntime();
-          const account = resolveZalouserAccountSync({ cfg: cfg, accountId });
+          const account = resolveZalouserAccountSync({ cfg, accountId });
           const groups = await listZaloGroupsMatching(account.profile, query);
           const rows = groups.map((group) =>
             mapGroup({

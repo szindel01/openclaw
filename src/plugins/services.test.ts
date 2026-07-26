@@ -1,3 +1,4 @@
+// Covers plugin service registration and lookup behavior.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginOrigin } from "./plugin-origin.types.js";
 import { createEmptyPluginRegistry } from "./registry.js";
@@ -16,6 +17,12 @@ vi.mock("../logging/subsystem.js", () => ({
 }));
 
 import { STATE_DIR } from "../config/paths.js";
+import { registerPluginHttpRoute } from "./http-registry.js";
+import {
+  pinActivePluginHttpRouteRegistry,
+  resetPluginRuntimeStateForTest,
+  setActivePluginRegistry,
+} from "./runtime.js";
 import { startPluginServices } from "./services.js";
 
 function createRegistry(
@@ -138,6 +145,7 @@ function createTrackingService(
 describe("startPluginServices", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetPluginRuntimeStateForTest();
   });
 
   it("starts services and stops them in reverse order", async () => {
@@ -158,6 +166,132 @@ describe("startPluginServices", () => {
     await handle.stop();
 
     expectServiceLifecycleState({ starts, stops, contexts, config });
+  });
+
+  it("binds gateway events to the owning plugin namespace and scope", async () => {
+    const broadcastPluginEvent = vi.fn();
+    await startPluginServices({
+      registry: createRegistry(
+        [
+          {
+            id: "events",
+            start: (ctx) => {
+              ctx.gatewayEvents?.emit("changed", { revision: 1 }, { scope: "operator.read" });
+            },
+          },
+        ],
+        "workboard",
+      ),
+      config: createServiceConfig(),
+      broadcastPluginEvent,
+    });
+
+    expect(broadcastPluginEvent).toHaveBeenCalledWith(
+      "plugin.workboard.changed",
+      { revision: 1 },
+      "operator.read",
+    );
+  });
+
+  it("rejects unsafe event names, scopes, and payloads", async () => {
+    let context: OpenClawPluginServiceContext | undefined;
+    const broadcastPluginEvent = vi.fn();
+    await startPluginServices({
+      registry: createRegistry([
+        {
+          id: "events",
+          start: (ctx) => {
+            context = ctx;
+          },
+        },
+      ]),
+      config: createServiceConfig(),
+      broadcastPluginEvent,
+    });
+    const emit = context?.gatewayEvents?.emit as unknown as (
+      event: string,
+      payload: unknown,
+      opts: { scope: string },
+    ) => void;
+
+    expect(() => emit("other.changed", {}, { scope: "operator.read" })).toThrow(
+      "invalid plugin gateway event name",
+    );
+    expect(() => emit("changed", { value: Number.NaN }, { scope: "operator.read" })).toThrow(
+      "bounded JSON",
+    );
+    expect(() => emit("changed", {}, { scope: "operator.approvals" })).toThrow("operator scope");
+    expect(broadcastPluginEvent).not.toHaveBeenCalled();
+  });
+
+  it("revokes gateway event emitters after failed start and stop", async () => {
+    const contexts: OpenClawPluginServiceContext[] = [];
+    const broadcastPluginEvent = vi.fn();
+    const handle = await startPluginServices({
+      registry: createRegistry([
+        {
+          id: "events",
+          start: (ctx) => {
+            contexts.push(ctx);
+          },
+          stop: (ctx) => {
+            ctx.gatewayEvents?.emit("stopping", {}, { scope: "operator.read" });
+          },
+        },
+        {
+          id: "failed-events",
+          start: (ctx) => {
+            contexts.push(ctx);
+            throw new Error("start failed");
+          },
+        },
+      ]),
+      config: createServiceConfig(),
+      broadcastPluginEvent,
+    });
+
+    expect(() =>
+      contexts[1]?.gatewayEvents?.emit("changed", {}, { scope: "operator.read" }),
+    ).toThrow("no longer active");
+    await handle.stop();
+    expect(() =>
+      contexts[0]?.gatewayEvents?.emit("changed", {}, { scope: "operator.read" }),
+    ).toThrow("no longer active");
+    expect(broadcastPluginEvent).toHaveBeenCalledOnce();
+    expect(broadcastPluginEvent).toHaveBeenCalledWith(
+      "plugin.plugin:test.stopping",
+      {},
+      "operator.read",
+    );
+  });
+
+  it("registers dynamic HTTP routes into the service registry scope", async () => {
+    const serviceRegistry = createRegistry([
+      {
+        id: "route-service",
+        start: () => {
+          registerPluginHttpRoute({
+            path: "/service-route",
+            auth: "plugin",
+            handler: vi.fn(),
+          });
+        },
+      },
+    ]);
+    const pinnedRegistry = createEmptyPluginRegistry();
+
+    setActivePluginRegistry(pinnedRegistry);
+    pinActivePluginHttpRouteRegistry(pinnedRegistry);
+
+    const handle = await startPluginServices({
+      registry: serviceRegistry,
+      config: createServiceConfig(),
+    });
+
+    expect(serviceRegistry.httpRoutes.map((route) => route.path)).toEqual(["/service-route"]);
+    expect(pinnedRegistry.httpRoutes).toHaveLength(0);
+
+    await handle.stop();
   });
 
   it("logs start/stop failures and continues", async () => {
@@ -232,6 +366,58 @@ describe("startPluginServices", () => {
     ]);
   });
 
+  it("passes a scoped startup trace through service context for owned subspans", async () => {
+    const contexts: OpenClawPluginServiceContext[] = [];
+    const measured: string[] = [];
+    const details: Array<{
+      name: string;
+      metrics: ReadonlyArray<readonly [string, number | string]>;
+    }> = [];
+    const startupTrace: NonNullable<Parameters<typeof startPluginServices>[0]["startupTrace"]> = {
+      measure: async (name, run) => {
+        measured.push(name);
+        return await run();
+      },
+      detail: (name, metrics) => {
+        details.push({ name, metrics });
+      },
+    };
+
+    await startTrackingServices({
+      services: [
+        {
+          id: "service-a",
+          start: async (ctx) => {
+            contexts.push(ctx);
+            ctx.startupTrace?.detail?.("probe.result", [["healthyCount", 1]]);
+            await ctx.startupTrace?.measure("config:resolve", async () => {});
+          },
+        },
+      ],
+      startupTrace,
+    });
+
+    expect(contexts[0]?.startupTrace).not.toBe(startupTrace);
+    expect(measured).toEqual([
+      "sidecars.plugin-services.plugin~003Atest.service-a",
+      "sidecars.plugin-services.plugin~003Atest.service-a.config~003Aresolve",
+    ]);
+    expect(details).toEqual([
+      {
+        name: "sidecars.plugin-services.plugin~003Atest.service-a.probe.result",
+        metrics: [["healthyCount", 1]],
+      },
+      {
+        name: "sidecars.plugin-services.summary",
+        metrics: [
+          ["serviceCount", 1],
+          ["startedCount", 1],
+          ["failedCount", 0],
+        ],
+      },
+    ]);
+  });
+
   it("keeps distinct service trace ownership keys non-colliding", async () => {
     const measured: string[] = [];
     const startupTrace: NonNullable<Parameters<typeof startPluginServices>[0]["startupTrace"]> = {
@@ -279,6 +465,23 @@ describe("startPluginServices", () => {
 
     expect(prometheusContexts[0]?.internalDiagnostics?.onEvent).toBeTypeOf("function");
     expect(prometheusContexts[0]?.internalDiagnostics?.emit).toBeTypeOf("function");
+
+    const officialDiagnosticsOtelContexts: OpenClawPluginServiceContext[] = [];
+    const officialDiagnosticsOtelService = createTrackingService("diagnostics-otel", {
+      contexts: officialDiagnosticsOtelContexts,
+    });
+    await startPluginServices({
+      registry: createRegistry(
+        [officialDiagnosticsOtelService],
+        "diagnostics-otel",
+        "config",
+        true,
+      ),
+      config: createServiceConfig(),
+    });
+
+    expect(officialDiagnosticsOtelContexts[0]?.internalDiagnostics?.onEvent).toBeTypeOf("function");
+    expect(officialDiagnosticsOtelContexts[0]?.internalDiagnostics?.emit).toBeTypeOf("function");
 
     const officialInstallContexts: OpenClawPluginServiceContext[] = [];
     const officialInstallService = createTrackingService("diagnostics-prometheus", {

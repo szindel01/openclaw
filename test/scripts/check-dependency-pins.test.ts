@@ -1,3 +1,4 @@
+// Check Dependency Pins tests cover check dependency pins script behavior.
 import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -17,7 +18,7 @@ const nestedGitEnvKeys = [
 ] as const;
 
 function createNestedGitEnv(): NodeJS.ProcessEnv {
-  const env = {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_TERMINAL_PROMPT: "0",
@@ -62,6 +63,8 @@ describe("check-dependency-pins", () => {
         linked: "link:../linked",
         local: "file:../local",
         gitPinned: "github:owner/repo#0123456789abcdef0123456789abcdef01234567",
+        tarballPinned:
+          "https://codeload.github.com/owner/repo/tar.gz/0123456789abcdef0123456789abcdef01234567",
       },
       devDependencies: {
         devExact: "4.5.6",

@@ -1,12 +1,14 @@
+// Covers shared media-generation runtime polling and timeout helpers.
+import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/types.js";
 import {
-  deriveAspectRatioFromSize,
   normalizeDurationToClosestMax,
   resolveCapabilityModelCandidates,
   resolveClosestAspectRatio,
   resolveClosestResolution,
   resolveClosestSize,
+  resolveMediaProviderRequestTimeoutMs,
   throwCapabilityGenerationFailure,
 } from "./runtime-shared.js";
 
@@ -102,7 +104,7 @@ describe("media-generation runtime shared candidates", () => {
         agents: {
           defaults: {
             model: {
-              primary: "openai-codex/gpt-5.5",
+              primary: "openai/gpt-5.5",
             },
           },
         },
@@ -117,7 +119,7 @@ describe("media-generation runtime shared candidates", () => {
         },
         {
           id: "openai",
-          aliases: ["openai-codex"],
+          aliases: ["openai"],
           defaultModel: "gpt-image-2",
           isConfigured: () => true,
         },
@@ -130,7 +132,7 @@ describe("media-generation runtime shared candidates", () => {
     ]);
   });
 
-  it("disables implicit provider expansion when mediaGenerationAutoProviderFallback=false", () => {
+  it("keeps implicit provider expansion enabled when the retired opt-out is present", () => {
     let listProviderCalls = 0;
     const candidates = resolveCapabilityModelCandidates({
       cfg: {
@@ -156,8 +158,11 @@ describe("media-generation runtime shared candidates", () => {
       },
     });
 
-    expect(candidates).toEqual([{ provider: "google", model: "gemini-3.1-flash-image-preview" }]);
-    expect(listProviderCalls).toBe(0);
+    expect(candidates).toEqual([
+      { provider: "google", model: "gemini-3.1-flash-image-preview" },
+      { provider: "openai", model: "gpt-image-1" },
+    ]);
+    expect(listProviderCalls).toBe(1);
   });
 
   it("treats an explicit model override as exact-only", () => {
@@ -207,12 +212,57 @@ describe("media-generation runtime shared candidates", () => {
 
     expect(candidates).toEqual([{ provider: "fal", model: "fal-ai/flux/dev" }]);
   });
+
+  it("prefers explicit provider refs over colliding slash-containing model IDs", () => {
+    const candidates = resolveCapabilityModelCandidates({
+      cfg: {} as OpenClawConfig,
+      modelConfig: {
+        primary: "google/lyria-3-pro-preview",
+      },
+      parseModelRef,
+      listProviders: () => [
+        {
+          id: "google",
+          defaultModel: "lyria-3-clip-preview",
+          models: ["lyria-3-clip-preview", "lyria-3-pro-preview"],
+          isConfigured: () => true,
+        },
+        {
+          id: "openrouter",
+          defaultModel: "google/lyria-3-clip-preview",
+          models: ["google/lyria-3-clip-preview", "google/lyria-3-pro-preview"],
+          isConfigured: () => true,
+        },
+      ],
+    });
+
+    expect(candidates[0]).toEqual({ provider: "google", model: "lyria-3-pro-preview" });
+  });
 });
 
 describe("media-generation runtime shared normalization", () => {
-  it("derives reduced aspect ratios from size strings", () => {
-    expect(deriveAspectRatioFromSize("1280x720")).toBe("16:9");
-    expect(deriveAspectRatioFromSize("1024x1536")).toBe("2:3");
+  it("caps media provider timeouts to the timer-safe range", () => {
+    expect(
+      resolveMediaProviderRequestTimeoutMs({
+        timeoutMs: Number.MAX_SAFE_INTEGER,
+        providerDefaultTimeoutMs: 30_000,
+      }),
+    ).toBe(MAX_TIMER_TIMEOUT_MS);
+    expect(
+      resolveMediaProviderRequestTimeoutMs({
+        timeoutMs: 0,
+        providerDefaultTimeoutMs: 45_000,
+      }),
+    ).toBe(45_000);
+  });
+
+  it("rejects unsafe size dimensions before deriving ratios", () => {
+    expect(
+      resolveClosestSize({
+        requestedSize: "9007199254740993x3",
+        supportedSizes: ["1024x1024", "1536x1024"],
+      }),
+    ).toBeUndefined();
   });
 
   it("maps unsupported sizes to the closest supported size", () => {
@@ -240,6 +290,26 @@ describe("media-generation runtime shared normalization", () => {
         supportedResolutions: ["1K", "4K"],
       }),
     ).toBe("1K");
+  });
+
+  it("maps video-style resolutions by numeric distance", () => {
+    expect(
+      resolveClosestResolution({
+        requestedResolution: "480P",
+        supportedResolutions: ["360P", "540P", "720P"],
+        order: ["360P", "480P", "540P", "720P"],
+      }),
+    ).toBe("540P");
+  });
+
+  it("does not map across image and video resolution units", () => {
+    expect(
+      resolveClosestResolution({
+        requestedResolution: "4K",
+        supportedResolutions: ["768P", "1080P"],
+        order: ["360P", "480P", "540P", "720P", "768P", "1080P"],
+      }),
+    ).toBeUndefined();
   });
 
   it("clamps durations to the closest supported max", () => {

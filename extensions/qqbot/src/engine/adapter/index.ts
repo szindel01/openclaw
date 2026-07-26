@@ -1,3 +1,5 @@
+// Qqbot plugin entrypoint registers its OpenClaw integration.
+import type { ApprovalResolveResult } from "openclaw/plugin-sdk/approval-gateway-runtime";
 import type { ResolvedChannelMessageIngress } from "openclaw/plugin-sdk/channel-ingress-runtime";
 import type { EffectivePolicyInput } from "../access/resolve-policy.js";
 import type { FetchMediaOptions, FetchMediaResult, SecretInputRef } from "./types.js";
@@ -45,32 +47,36 @@ export interface PlatformAdapter {
   hasConfiguredSecret(value: unknown): boolean;
   normalizeSecretInputString(value: unknown): string | undefined;
   resolveSecretInputString(params: { value: unknown; path: string }): string | undefined;
-  resolveApproval?(approvalId: string, decision: string): Promise<boolean>;
+  resolveApproval?(params: {
+    approvalId: string;
+    approvalKind: "exec" | "plugin";
+    decision: "allow-once" | "allow-always" | "deny";
+  }): Promise<ApprovalResolveResult>;
 }
 
-let _adapter: PlatformAdapter | null = null;
-let _adapterFactory: (() => PlatformAdapter) | null = null;
+let platformAdapter: PlatformAdapter | null = null;
+let platformAdapterFactory: (() => PlatformAdapter) | null = null;
 
 export function registerPlatformAdapter(adapter: PlatformAdapter): void {
-  _adapter = adapter;
+  platformAdapter = adapter;
 }
 
 export function registerPlatformAdapterFactory(factory: () => PlatformAdapter): void {
-  _adapterFactory = factory;
+  platformAdapterFactory = factory;
 }
 
 export function getPlatformAdapter(): PlatformAdapter {
-  if (!_adapter && _adapterFactory) {
-    _adapter = _adapterFactory();
+  if (!platformAdapter && platformAdapterFactory) {
+    platformAdapter = platformAdapterFactory();
   }
-  if (!_adapter) {
+  if (!platformAdapter) {
     throw new Error(
       "PlatformAdapter not registered. Call registerPlatformAdapter() during bootstrap.",
     );
   }
-  return _adapter;
+  return platformAdapter;
 }
 
 export function hasPlatformAdapter(): boolean {
-  return _adapter !== null || _adapterFactory !== null;
+  return platformAdapter !== null || platformAdapterFactory !== null;
 }

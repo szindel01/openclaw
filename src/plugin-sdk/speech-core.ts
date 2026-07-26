@@ -32,8 +32,10 @@ export {
   normalizeLanguageCode,
   normalizeSeed,
   requireInRange,
+  resolveSpeechProviderApiKey,
 } from "../tts/tts-core.js";
 export { parseTtsDirectives } from "../tts/directives.js";
+export { parseSpeechDirectiveNumberOverride } from "../tts/directive-number.js";
 export {
   canonicalizeSpeechProviderId,
   getSpeechProvider,

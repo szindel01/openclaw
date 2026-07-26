@@ -1,34 +1,35 @@
+// Update command tests cover update command orchestration and filesystem effects.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { resolveGatewayInstallEntrypoint } from "../../daemon/gateway-entrypoint.js";
+import type { GatewayService } from "../../daemon/service.js";
+import type { UpdateRunResult } from "../../infra/update-runner.js";
 import {
-  buildGatewayInstallEntrypointCandidates as resolveGatewayInstallEntrypointCandidates,
-  resolveGatewayInstallEntrypoint,
-} from "../../daemon/gateway-entrypoint.js";
+  updatePluginsAfterCoreUpdate,
+  type PostCorePluginUpdateResult,
+} from "./update-command-plugins.js";
 import {
   buildInvalidConfigPostCoreUpdateResult,
   collectMissingPluginInstallPayloads,
+  resolvePostSyncPluginUpdateSkipIds,
+} from "./update-command-plugins.test-support.js";
+import { resolvePostCoreUpdateChildStdio } from "./update-command-post-core.js";
+import { applyPostPluginConfigValidation } from "./update-command-post-plugin-validation.js";
+import {
+  resolvePostInstallDoctorEnv,
+  resolvePostUpdateServiceStateReadEnv,
+  resolveUpdatedGatewayRestartPort,
+  shouldPrepareUpdatedInstallRestart,
+} from "./update-command-service.js";
+import {
+  formatPostUpdateGatewayRecoveryInstructions,
+  hasLoadedLaunchdKeepAliveSupervisor,
   recoverInstalledLaunchAgentAfterUpdate,
   recoverLaunchAgentAndRecheckGatewayHealth,
-  resolvePostCoreUpdateChildStdio,
-  resolvePostInstallDoctorEnv,
-  shouldPrepareUpdatedInstallRestart,
-  resolveUpdatedGatewayRestartPort,
   shouldUseLegacyProcessRestartAfterUpdate,
-  updatePluginsAfterCoreUpdate,
-} from "./update-command.js";
-
-describe("resolveGatewayInstallEntrypointCandidates", () => {
-  it("prefers index.js before legacy entry.js", () => {
-    expect(resolveGatewayInstallEntrypointCandidates("/tmp/openclaw-root")).toEqual([
-      path.join("/tmp/openclaw-root", "dist", "index.js"),
-      path.join("/tmp/openclaw-root", "dist", "index.mjs"),
-      path.join("/tmp/openclaw-root", "dist", "entry.js"),
-      path.join("/tmp/openclaw-root", "dist", "entry.mjs"),
-    ]);
-  });
-});
+} from "./update-command-service.test-support.js";
 
 describe("resolveGatewayInstallEntrypoint", () => {
   it("prefers dist/index.js over dist/entry.js when both exist", async () => {
@@ -54,6 +55,45 @@ describe("resolveGatewayInstallEntrypoint", () => {
   });
 });
 
+describe("applyPostPluginConfigValidation", () => {
+  const pluginUpdate = {
+    status: "ok",
+    changed: true,
+    sync: {
+      changed: true,
+      switchedToBundled: [],
+      switchedToNpm: [],
+      warnings: [],
+      errors: [],
+    },
+    npm: { changed: true, outcomes: [] },
+    integrityDrifts: [],
+    warnings: [],
+  } satisfies PostCorePluginUpdateResult;
+
+  it("fails closed when updated plugin migrations leave config invalid", () => {
+    expect(applyPostPluginConfigValidation(pluginUpdate, false)).toMatchObject({
+      status: "error",
+      reason: "post-plugin-doctor-invalid-config",
+      warnings: [
+        {
+          guidance: ["Run `openclaw doctor --fix`, then rerun `openclaw update repair`."],
+        },
+      ],
+    });
+  });
+
+  it("preserves an earlier plugin update error", () => {
+    const failed = {
+      ...pluginUpdate,
+      status: "error" as const,
+      reason: "plugin-sync-failed",
+    };
+
+    expect(applyPostPluginConfigValidation(failed, false)).toBe(failed);
+  });
+});
+
 describe("shouldPrepareUpdatedInstallRestart", () => {
   it("prepares package update restarts when the service is installed but stopped", () => {
     expect(
@@ -75,7 +115,18 @@ describe("shouldPrepareUpdatedInstallRestart", () => {
     ).toBe(false);
   });
 
-  it("keeps non-package updates tied to the loaded service state", () => {
+  it("does not prepare package restart for a service owned by another root", () => {
+    expect(
+      shouldPrepareUpdatedInstallRestart({
+        updateMode: "npm",
+        serviceInstalled: true,
+        serviceLoaded: true,
+        serviceMatchesMutationRoot: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps non-package updates tied to the matching loaded service state", () => {
     expect(
       shouldPrepareUpdatedInstallRestart({
         updateMode: "git",
@@ -88,6 +139,26 @@ describe("shouldPrepareUpdatedInstallRestart", () => {
         updateMode: "git",
         serviceInstalled: true,
         serviceLoaded: true,
+        serviceMatchesUpdateRoot: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldPrepareUpdatedInstallRestart({
+        updateMode: "git",
+        serviceInstalled: true,
+        serviceLoaded: true,
+        serviceMatchesUpdateRoot: true,
+      }),
+    ).toBe(true);
+  });
+
+  it("prepares git restart when this update stopped the managed service", () => {
+    expect(
+      shouldPrepareUpdatedInstallRestart({
+        updateMode: "git",
+        serviceInstalled: true,
+        serviceLoaded: false,
+        serviceStoppedForUpdate: true,
       }),
     ).toBe(true);
   });
@@ -112,6 +183,53 @@ describe("resolveUpdatedGatewayRestartPort", () => {
         serviceEnv: {},
       }),
     ).toBe(19000);
+  });
+});
+
+describe("resolvePostUpdateServiceStateReadEnv", () => {
+  it("keeps package restart preparation anchored to the pre-update service env", () => {
+    const processEnv = {
+      OPENCLAW_STATE_DIR: "/source/state",
+      OPENCLAW_CONFIG_PATH: "/source/openclaw.json",
+    } as NodeJS.ProcessEnv;
+    const prePackageServiceEnv = {
+      OPENCLAW_STATE_DIR: "/managed/state",
+      OPENCLAW_CONFIG_PATH: "/managed/openclaw.json",
+    } as NodeJS.ProcessEnv;
+
+    expect(
+      resolvePostUpdateServiceStateReadEnv({
+        updateMode: "npm",
+        processEnv,
+        prePackageServiceEnv,
+      }),
+    ).toBe(prePackageServiceEnv);
+  });
+
+  it("keeps git updates tied to the caller environment", () => {
+    const processEnv = { OPENCLAW_STATE_DIR: "/source/state" } as NodeJS.ProcessEnv;
+    const prePackageServiceEnv = { OPENCLAW_STATE_DIR: "/managed/state" } as NodeJS.ProcessEnv;
+
+    expect(
+      resolvePostUpdateServiceStateReadEnv({
+        updateMode: "git",
+        processEnv,
+        prePackageServiceEnv,
+      }),
+    ).toBe(processEnv);
+  });
+
+  it("uses the managed service environment for git updates stopped by this updater", () => {
+    const processEnv = { OPENCLAW_STATE_DIR: "/source/state" } as NodeJS.ProcessEnv;
+    const preManagedServiceEnv = { OPENCLAW_STATE_DIR: "/managed/state" } as NodeJS.ProcessEnv;
+
+    expect(
+      resolvePostUpdateServiceStateReadEnv({
+        updateMode: "git",
+        processEnv,
+        preManagedServiceEnv,
+      }),
+    ).toBe(preManagedServiceEnv);
   });
 });
 
@@ -218,6 +336,126 @@ describe("collectMissingPluginInstallPayloads", () => {
         {
           pluginId: "no-package-json",
           installPath: noPackageJsonDir,
+          reason: "missing-package-json",
+        },
+      ]);
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts tracked bundle records validated by the shared bundle loader", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-update-plugin-payload-"));
+    const bundleDir = path.join(tmpDir, "state", "clawhub", "cursor-bundle");
+    try {
+      await fs.mkdir(path.join(bundleDir, ".cursor-plugin"), { recursive: true });
+      await fs.writeFile(
+        path.join(bundleDir, ".cursor-plugin", "plugin.json"),
+        JSON.stringify({ name: "cursor-bundle" }),
+        "utf8",
+      );
+      await expect(
+        collectMissingPluginInstallPayloads({
+          env: { HOME: tmpDir } as NodeJS.ProcessEnv,
+          records: {
+            "cursor-bundle": {
+              source: "clawhub",
+              clawhubFamily: "bundle-plugin",
+              installPath: bundleDir,
+            },
+          },
+        }),
+      ).resolves.toEqual([]);
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts persisted marketplace bundle records without transient format metadata", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-update-plugin-payload-"));
+    const bundleDir = path.join(tmpDir, "state", "marketplace", "cursor-bundle");
+    try {
+      await fs.mkdir(path.join(bundleDir, ".cursor-plugin"), { recursive: true });
+      await fs.writeFile(
+        path.join(bundleDir, ".cursor-plugin", "plugin.json"),
+        JSON.stringify({ name: "cursor-bundle" }),
+        "utf8",
+      );
+      await expect(
+        collectMissingPluginInstallPayloads({
+          env: { HOME: tmpDir } as NodeJS.ProcessEnv,
+          records: {
+            "cursor-bundle": {
+              source: "marketplace",
+              installPath: bundleDir,
+              marketplaceName: "Local",
+              marketplaceSource: "local/repo",
+              marketplacePlugin: "cursor-bundle",
+            },
+          },
+        }),
+      ).resolves.toEqual([]);
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps dual-format bundle records on the native package payload path", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-update-plugin-payload-"));
+    const bundleDir = path.join(tmpDir, "state", "clawhub", "dual-format-bundle");
+    try {
+      await fs.mkdir(path.join(bundleDir, ".codex-plugin"), { recursive: true });
+      await fs.writeFile(
+        path.join(bundleDir, ".codex-plugin", "plugin.json"),
+        JSON.stringify({ name: "dual-format-bundle" }),
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(bundleDir, "package.json"),
+        JSON.stringify({
+          name: "dual-format-bundle",
+          openclaw: { extensions: ["./missing-extension.js"] },
+        }),
+        "utf8",
+      );
+      await expect(
+        collectMissingPluginInstallPayloads({
+          env: { HOME: tmpDir } as NodeJS.ProcessEnv,
+          records: {
+            "dual-format-bundle": {
+              source: "clawhub",
+              clawhubFamily: "bundle-plugin",
+              installPath: bundleDir,
+            },
+          },
+        }),
+      ).resolves.toEqual([]);
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps corrupt tracked bundle records eligible for payload repair", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-update-plugin-payload-"));
+    const bundleDir = path.join(tmpDir, "state", "clawhub", "bad-bundle");
+    try {
+      await fs.mkdir(path.join(bundleDir, ".codex-plugin"), { recursive: true });
+      await fs.writeFile(path.join(bundleDir, ".codex-plugin", "plugin.json"), "[]", "utf8");
+      await expect(
+        collectMissingPluginInstallPayloads({
+          env: { HOME: tmpDir } as NodeJS.ProcessEnv,
+          records: {
+            "bad-bundle": {
+              source: "clawhub",
+              clawhubFamily: "bundle-plugin",
+              installPath: bundleDir,
+            },
+          },
+        }),
+      ).resolves.toEqual([
+        {
+          pluginId: "bad-bundle",
+          installPath: bundleDir,
           reason: "missing-package-json",
         },
       ]);
@@ -336,6 +574,18 @@ describe("collectMissingPluginInstallPayloads", () => {
   });
 });
 
+describe("resolvePostSyncPluginUpdateSkipIds", () => {
+  it("skips plugins already switched through ClawHub or npm and repaired payloads", () => {
+    expect(
+      resolvePostSyncPluginUpdateSkipIds({
+        switchedToClawHub: ["whatsapp"],
+        switchedToNpm: ["voice-call"],
+        repairedMissingPayloadIds: new Set(["telegram"]),
+      }),
+    ).toStrictEqual(new Set(["whatsapp", "voice-call", "telegram"]));
+  });
+});
+
 describe("shouldUseLegacyProcessRestartAfterUpdate", () => {
   it("never restarts package updates through the pre-update process", () => {
     expect(shouldUseLegacyProcessRestartAfterUpdate({ updateMode: "npm" })).toBe(false);
@@ -348,6 +598,52 @@ describe("shouldUseLegacyProcessRestartAfterUpdate", () => {
     expect(shouldUseLegacyProcessRestartAfterUpdate({ updateMode: "unknown" })).toBe(true);
   });
 });
+
+describe("formatPostUpdateGatewayRecoveryInstructions", () => {
+  const result: UpdateRunResult = {
+    status: "error",
+    mode: "git",
+    steps: [],
+    durationMs: 0,
+  };
+
+  it("uses systemd wording on Linux instead of macOS LaunchAgent instructions", () => {
+    const [line] = formatPostUpdateGatewayRecoveryInstructions(result, "linux");
+
+    expect(line).toContain("the systemd user service");
+    expect(line).toContain("openclaw gateway restart");
+    expect(line).toContain("openclaw gateway install --force");
+    expect(line).toContain("openclaw gateway status --deep");
+    expect(line).not.toContain("Linux reports");
+    expect(line).not.toContain("macOS");
+    expect(line).not.toContain("LaunchAgent");
+  });
+
+  it("keeps LaunchAgent recovery wording on macOS", () => {
+    const [line] = formatPostUpdateGatewayRecoveryInstructions(result, "darwin");
+
+    expect(line).toContain("the LaunchAgent is installed but not loaded");
+    expect(line).toContain("logged-in macOS user session");
+  });
+
+  it("uses Windows service-manager wording on Windows", () => {
+    const [line] = formatPostUpdateGatewayRecoveryInstructions(result, "win32");
+
+    expect(line).toContain("the gateway Scheduled Task or Windows login item");
+    expect(line).not.toContain("LaunchAgent");
+    expect(line).not.toContain("Startup-folder");
+  });
+
+  it("uses generic service-manager wording for unsupported Node platforms", () => {
+    const [line] = formatPostUpdateGatewayRecoveryInstructions(result, "freebsd");
+
+    expect(line).toContain("local service manager");
+    expect(line).not.toContain("systemd");
+    expect(line).not.toContain("LaunchAgent");
+    expect(line).not.toContain("Scheduled Task");
+  });
+});
+
 describe("recoverInstalledLaunchAgentAfterUpdate", () => {
   it("re-bootstraps an installed-but-not-loaded macOS LaunchAgent after update", async () => {
     const service = {} as never;
@@ -509,6 +805,7 @@ describe("recoverLaunchAgentAndRecheckGatewayHealth", () => {
       port: 18790,
       expectedVersion: "2026.5.3",
       env: { OPENCLAW_PROFILE: "stomme", OPENCLAW_PORT: "18790" },
+      supervisorKeepsAlive: true,
     });
   });
 
@@ -547,6 +844,36 @@ describe("recoverLaunchAgentAndRecheckGatewayHealth", () => {
   });
 });
 
+describe("hasLoadedLaunchdKeepAliveSupervisor", () => {
+  it("requires a loaded LaunchAgent before extending restart health", async () => {
+    const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
+    const isLoaded = vi.fn().mockResolvedValue(false);
+    const service = { isLoaded } as unknown as GatewayService;
+
+    await expect(
+      hasLoadedLaunchdKeepAliveSupervisor({ service, env: { OPENCLAW_PROFILE: "work" } }),
+    ).resolves.toBe(false);
+    isLoaded.mockResolvedValue(true);
+    await expect(hasLoadedLaunchdKeepAliveSupervisor({ service })).resolves.toBe(true);
+
+    platformSpy.mockRestore();
+  });
+
+  it("does not inspect KeepAlive supervision outside macOS", async () => {
+    const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue("linux");
+    const isLoaded = vi.fn().mockResolvedValue(true);
+
+    await expect(
+      hasLoadedLaunchdKeepAliveSupervisor({
+        service: { isLoaded } as unknown as GatewayService,
+      }),
+    ).resolves.toBe(false);
+    expect(isLoaded).not.toHaveBeenCalled();
+
+    platformSpy.mockRestore();
+  });
+});
+
 describe("resolvePostCoreUpdateChildStdio", () => {
   it('returns "pipe" on Windows so the child never inherits the parent console handles', () => {
     // On Windows, stdio:"inherit" passes the parent's console HANDLE to the child process.
@@ -558,6 +885,11 @@ describe("resolvePostCoreUpdateChildStdio", () => {
   it('returns "inherit" on non-Windows platforms', () => {
     expect(resolvePostCoreUpdateChildStdio("linux")).toBe("inherit");
     expect(resolvePostCoreUpdateChildStdio("darwin")).toBe("inherit");
+  });
+
+  it('returns "pipe" for JSON output on every platform', () => {
+    expect(resolvePostCoreUpdateChildStdio("linux", true)).toBe("pipe");
+    expect(resolvePostCoreUpdateChildStdio("darwin", true)).toBe("pipe");
   });
 });
 
@@ -591,7 +923,7 @@ describe("updatePluginsAfterCoreUpdate (invalid config end-to-end)", () => {
           "Plugin post-update convergence skipped because the config is invalid; refusing to restart the gateway with an unverified plugin set.",
         guidance: [
           "Run `openclaw doctor` to inspect the config validation errors.",
-          "Once the config parses, rerun `openclaw update`.",
+          "Once the config parses, rerun `openclaw update repair`.",
         ],
       },
     ]);
@@ -610,7 +942,7 @@ describe("buildInvalidConfigPostCoreUpdateResult", () => {
     const built = buildInvalidConfigPostCoreUpdateResult();
     expect(built.guidance).toStrictEqual([
       "Run `openclaw doctor` to inspect the config validation errors.",
-      "Once the config parses, rerun `openclaw update`.",
+      "Once the config parses, rerun `openclaw update repair`.",
     ]);
     expect(built.result.warnings).toStrictEqual([
       {

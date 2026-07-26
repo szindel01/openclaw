@@ -1,9 +1,11 @@
-import { spawnSync } from "node:child_process";
+// Extension test boundary tests enforce extension test layout rules.
 import fs from "node:fs";
 import path from "node:path";
 import { BUNDLED_PLUGIN_PATH_PREFIX } from "openclaw/plugin-sdk/test-fixtures";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { GUARDED_EXTENSION_PUBLIC_SURFACE_BASENAMES } from "../src/plugin-sdk/test-helpers/public-artifacts.js";
+import { expectNoReaddirSyncDuring } from "../src/test-utils/fs-scan-assertions.js";
+import { listGitTrackedFiles, toRepoRelativePath } from "../src/test-utils/repo-files.js";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const ALLOWED_EXTENSION_PUBLIC_SURFACE_BASENAMES = new Set(
@@ -20,23 +22,11 @@ const ROOTDIR_BOUNDARY_CANARY_RE =
   /(^|\/)__rootdir_boundary_canary__\.(?:[cm]?ts|[cm]?js|tsx|jsx)$/u;
 
 function listGitFiles(dir: string): string[] | null {
-  const relativeRoot = path.relative(repoRoot, dir).replaceAll(path.sep, "/");
+  const relativeRoot = toRepoRelativePath(repoRoot, dir);
   if (!relativeRoot || relativeRoot.startsWith("..") || path.isAbsolute(relativeRoot)) {
     return null;
   }
-  const result = spawnSync("git", ["ls-files", "--", relativeRoot], {
-    cwd: repoRoot,
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-  if (result.status !== 0) {
-    return null;
-  }
-  return result.stdout
-    .split("\n")
-    .map((line) => line.trim().replaceAll("\\", "/"))
-    .filter((line) => line.length > 0)
-    .toSorted((left, right) => left.localeCompare(right));
+  return listGitTrackedFiles({ repoRoot, pathspecs: relativeRoot });
 }
 
 function walk(dir: string, entries: string[] = []): string[] {
@@ -60,7 +50,7 @@ function walk(dir: string, entries: string[] = []): string[] {
     if (!entry.name.endsWith(".test.ts") && !entry.name.endsWith(".test.tsx")) {
       continue;
     }
-    entries.push(path.relative(repoRoot, fullPath).replaceAll(path.sep, "/"));
+    entries.push(toRepoRelativePath(repoRoot, fullPath));
   }
   return entries;
 }
@@ -91,7 +81,7 @@ function walkCode(dir: string, entries: string[] = []): string[] {
     if (!entry.name.endsWith(".ts") && !entry.name.endsWith(".tsx")) {
       continue;
     }
-    const relativePath = path.relative(repoRoot, fullPath).replaceAll(path.sep, "/");
+    const relativePath = toRepoRelativePath(repoRoot, fullPath);
     if (ROOTDIR_BOUNDARY_CANARY_RE.test(relativePath)) {
       continue;
     }
@@ -104,7 +94,7 @@ function findExtensionImports(source: string): string[] {
   return [
     ...source.matchAll(/from\s+["']((?:\.\.\/)+extensions\/[^"']+)["']/g),
     ...source.matchAll(/import\(\s*["']((?:\.\.\/)+extensions\/[^"']+)["']\s*\)/g),
-  ].map((match) => match[1]);
+  ].flatMap((match) => (match[1] === undefined ? [] : [match[1]]));
 }
 
 function isAllowedExtensionPublicImport(specifier: string): boolean {
@@ -117,7 +107,7 @@ function findPluginSdkImports(source: string): string[] {
   return [
     ...source.matchAll(/from\s+["']((?:\.\.\/)+plugin-sdk\/[^"']+)["']/g),
     ...source.matchAll(/import\(\s*["']((?:\.\.\/)+plugin-sdk\/[^"']+)["']\s*\)/g),
-  ].map((match) => match[1]);
+  ].flatMap((match) => (match[1] === undefined ? [] : [match[1]]));
 }
 
 function findBundledPluginPublicSurfaceImports(source: string): string[] {
@@ -134,11 +124,20 @@ function findRelativeSrcImports(source: string): string[] {
     ...source.matchAll(/from\s+["']((?:\.\.?\/)+src\/[^"']+)["']/g),
     ...source.matchAll(/import\(\s*["']((?:\.\.?\/)+src\/[^"']+)["']\s*\)/g),
     ...source.matchAll(/vi\.(?:mock|doMock)\s*\(\s*["']((?:\.\.?\/)+src\/[^"']+)["']/g),
-  ].map((match) => match[1]);
+  ].flatMap((match) => (match[1] === undefined ? [] : [match[1]]));
 }
 
 function getImportBasename(importPath: string): string {
   return importPath.split("/").at(-1) ?? importPath;
+}
+
+function readImportBindingName(binding: string): string {
+  return (
+    binding
+      .trim()
+      .replace(/^type\s+/u, "")
+      .split(/\s+as\s+/u)[0] ?? ""
+  );
 }
 
 function collectBundledPluginIds(): Set<string> {
@@ -197,8 +196,7 @@ function isAllowedCoreContractSuite(file: string, imports: readonly string[]): b
 
 describe("non-extension test boundaries", () => {
   it("lists boundary scan files from git without walking repo roots", () => {
-    const readdirSync = vi.spyOn(fs, "readdirSync");
-    try {
+    expectNoReaddirSyncDuring(() => {
       const srcTests = walk(path.join(repoRoot, "src"));
       const srcCode = walkCode(path.join(repoRoot, "src"));
       const pluginIds = collectBundledPluginIds();
@@ -206,10 +204,7 @@ describe("non-extension test boundaries", () => {
       expect(srcTests.length).toBeGreaterThan(0);
       expect(srcCode.length).toBeGreaterThan(0);
       expect(pluginIds.size).toBeGreaterThan(0);
-      expect(readdirSync).not.toHaveBeenCalled();
-    } finally {
-      readdirSync.mockRestore();
-    }
+    });
   });
 
   it("keeps plugin-owned behavior suites under the bundled plugin tree", () => {
@@ -338,9 +333,8 @@ describe("non-extension test boundaries", () => {
     expect(offenders).toStrictEqual([]);
   });
 
-  it("keeps extension tests off legacy broad testing barrels and repo helper bridges", () => {
+  it("keeps extension tests off the legacy test alias and repo helper bridges", () => {
     const bannedPatterns = [
-      /["']openclaw\/plugin-sdk\/testing["']/u,
       /["']openclaw\/plugin-sdk\/test-utils["']/u,
       /["'](?:\.\.\/)+(?:test\/helpers\/channels\/)[^"']+["']/u,
       /["'](?:\.\.\/)+(?:src\/channels\/plugins\/contracts\/test-helpers\/)[^"']+["']/u,
@@ -372,12 +366,39 @@ describe("non-extension test boundaries", () => {
     expect(offenders).toStrictEqual([]);
   });
 
-  it("keeps bundled extension sources off deprecated channel config schema aliases", () => {
+  it("keeps bundled extension sources on the canonical channel config schema facade", () => {
     const files = walkCode(path.join(repoRoot, "extensions"));
+    // The legacy/primitives shells stay export-compatible for third-party
+    // plugins only; bundled code imports channel-config-schema, plus the
+    // bundled facade strictly for retained bundled provider schemas.
+    const bannedSpecifiers = [
+      "openclaw/plugin-sdk/channel-config-schema-legacy",
+      "openclaw/plugin-sdk/channel-config-primitives",
+    ];
+    const bundledProviderSchemaNames = new Set([
+      "GoogleChatConfigSchema",
+      "IMessageConfigSchema",
+      "TelegramConfigSchema",
+      "WhatsAppConfigSchema",
+    ]);
+    const bundledFacadeBindingPattern =
+      /\b(?:import|export)\s+(?:type\s+)?\{(?<bindings>[^}]*)\}\s*from\s*["']openclaw\/plugin-sdk\/bundled-channel-config-schema["']/gu;
 
-    const offenders = files.filter((file) => {
+    const offenders = files.flatMap((file) => {
       const source = fs.readFileSync(path.join(repoRoot, file), "utf8");
-      return source.includes("openclaw/plugin-sdk/channel-config-schema-legacy");
+      const fileOffenders = bannedSpecifiers
+        .filter((specifier) => source.includes(specifier))
+        .map((specifier) => `${file}: ${specifier}`);
+      for (const match of source.matchAll(bundledFacadeBindingPattern)) {
+        const genericBindings = (match.groups?.bindings ?? "")
+          .split(",")
+          .map(readImportBindingName)
+          .filter((name) => name.length > 0 && !bundledProviderSchemaNames.has(name));
+        fileOffenders.push(
+          ...genericBindings.map((name) => `${file}: bundled-channel-config-schema#${name}`),
+        );
+      }
+      return fileOffenders;
     });
 
     expect(offenders).toStrictEqual([]);

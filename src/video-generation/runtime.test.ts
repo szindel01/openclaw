@@ -1,10 +1,10 @@
+// Video generation runtime tests cover provider execution and fallback behavior.
 import { beforeEach, describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/types.js";
 import {
   generateVideo,
   listRuntimeVideoGenerationProviders,
   type GenerateVideoParams,
-  type VideoGenerationRuntimeDeps,
 } from "./runtime.js";
 import type { VideoGenerationProvider, VideoGenerationProviderOptionType } from "./types.js";
 
@@ -12,7 +12,7 @@ let providers: VideoGenerationProvider[] = [];
 let listedConfigs: Array<OpenClawConfig | undefined> = [];
 let providerEnvVars: Record<string, string[]> = {};
 
-const runtimeDeps: VideoGenerationRuntimeDeps = {
+const runtimeDeps = {
   getProvider: (providerId) => providers.find((provider) => provider.id === providerId),
   listProviders: (config) => {
     listedConfigs.push(config);
@@ -23,10 +23,28 @@ const runtimeDeps: VideoGenerationRuntimeDeps = {
     debug: () => {},
     warn: () => {},
   },
-};
+} satisfies NonNullable<Parameters<typeof generateVideo>[1]>;
 
 function runGenerateVideo(params: GenerateVideoParams) {
-  return generateVideo(params, runtimeDeps);
+  const defaults = params.cfg.agents?.defaults as
+    | (NonNullable<OpenClawConfig["agents"]>["defaults"] & {
+        videoGenerationModel?: unknown;
+      })
+    | undefined;
+  const cfg =
+    defaults?.videoGenerationModel !== undefined && defaults.mediaModels?.video === undefined
+      ? {
+          ...params.cfg,
+          agents: {
+            ...params.cfg.agents,
+            defaults: {
+              ...defaults,
+              mediaModels: { ...defaults.mediaModels, video: defaults.videoGenerationModel },
+            },
+          },
+        }
+      : params.cfg;
+  return generateVideo({ ...params, cfg }, runtimeDeps);
 }
 
 function requireAttempt(
@@ -145,6 +163,37 @@ describe("video-generation runtime", () => {
     });
 
     expect(seenTimeoutMs).toBe(300_000);
+  });
+
+  it("uses provider default video-generation timeout when the call and config omit timeoutMs", async () => {
+    let seenTimeoutMs: number | undefined;
+    providers = [
+      {
+        id: "video-plugin",
+        defaultTimeoutMs: 600_000,
+        capabilities: {},
+        async generateVideo(req: { timeoutMs?: number }) {
+          seenTimeoutMs = req.timeoutMs;
+          return {
+            videos: [{ buffer: Buffer.from("mp4-bytes"), mimeType: "video/mp4" }],
+            model: "vid-v1",
+          };
+        },
+      },
+    ];
+
+    await runGenerateVideo({
+      cfg: {
+        agents: {
+          defaults: {
+            videoGenerationModel: { primary: "video-plugin/vid-v1" },
+          },
+        },
+      } as OpenClawConfig,
+      prompt: "animate a cat",
+    });
+
+    expect(seenTimeoutMs).toBe(600_000);
   });
 
   it("does not list providers when explicit config disables auto provider fallback", async () => {
@@ -1133,7 +1182,8 @@ describe("video-generation runtime", () => {
     await expect(
       runGenerateVideo({ cfg: {} as OpenClawConfig, prompt: "animate a cat" }),
     ).rejects.toThrow(
-      'No video-generation model configured. Set agents.defaults.videoGenerationModel.primary to a provider/model like "motion-one/animate-v1". If you want a specific provider, also configure that provider\'s auth/API key first (motion-one: MOTION_ONE_API_KEY).',
+      'No video-generation model configured. Set agents.defaults.mediaModels.video.primary to a provider/model like "motion-one/animate-v1". If you want a specific provider, also configure that provider\'s auth/API key first (motion-one: MOTION_ONE_API_KEY).',
     );
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

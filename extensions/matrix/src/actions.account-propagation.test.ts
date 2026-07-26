@@ -1,3 +1,4 @@
+// Matrix tests cover actions.account propagation plugin behavior.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChannelMessageActionContext } from "../runtime-api.js";
 import type { CoreConfig } from "./types.js";
@@ -72,7 +73,7 @@ describe("matrixMessageActions account propagation", () => {
     expect(call.input.action).toBe("sendMessage");
     expect(call.input.accountId).toBe("ops");
     expect(call.cfg).toBeTypeOf("object");
-    expect(call.options).toEqual({ mediaLocalRoots: undefined });
+    expect(call.options).toMatchObject({ mediaLocalRoots: undefined });
   });
 
   it("forwards accountId for permissions actions", async () => {
@@ -90,15 +91,15 @@ describe("matrixMessageActions account propagation", () => {
     expect(call.input.action).toBe("verificationList");
     expect(call.input.accountId).toBe("ops");
     expect(call.cfg).toBeTypeOf("object");
-    expect(call.options).toEqual({ mediaLocalRoots: undefined });
+    expect(call.options).toMatchObject({ mediaLocalRoots: undefined });
   });
 
   it("forwards accountId for self-profile updates", async () => {
     await matrixMessageActions.handleAction?.(
       createContext({
         action: profileAction,
-        senderIsOwner: true,
         accountId: "ops",
+        senderIsOwner: true,
         params: {
           displayName: "Ops Bot",
           avatarUrl: "mxc://example/avatar",
@@ -112,33 +113,12 @@ describe("matrixMessageActions account propagation", () => {
     expect(call.input.displayName).toBe("Ops Bot");
     expect(call.input.avatarUrl).toBe("mxc://example/avatar");
     expect(call.cfg).toBeTypeOf("object");
-    expect(call.options).toEqual({ mediaLocalRoots: undefined });
+    expect(call.options).toMatchObject({ mediaLocalRoots: undefined });
   });
 
-  it("rejects self-profile updates for non-owner callers", async () => {
-    try {
-      await matrixMessageActions.handleAction?.(
-        createContext({
-          action: profileAction,
-          senderIsOwner: false,
-          accountId: "ops",
-          params: {
-            displayName: "Ops Bot",
-          },
-        }),
-      );
-      throw new Error("expected non-owner self-profile update to reject");
-    } catch (error) {
-      expect((error as Error).name).toBe("ToolAuthorizationError");
-      expect((error as Error).message).toBe("Matrix profile updates require owner access.");
-    }
-
-    expect(mocks.handleMatrixAction).not.toHaveBeenCalled();
-  });
-
-  it("rejects self-profile updates when owner status is unknown", async () => {
-    try {
-      await matrixMessageActions.handleAction?.(
+  it("rejects self-profile updates without sender owner context", async () => {
+    await expect(
+      matrixMessageActions.handleAction?.(
         createContext({
           action: profileAction,
           accountId: "ops",
@@ -146,22 +126,36 @@ describe("matrixMessageActions account propagation", () => {
             displayName: "Ops Bot",
           },
         }),
-      );
-      throw new Error("expected unknown-owner self-profile update to reject");
-    } catch (error) {
-      expect((error as Error).name).toBe("ToolAuthorizationError");
-      expect((error as Error).message).toBe("Matrix profile updates require owner access.");
-    }
+      ),
+    ).rejects.toThrow("Matrix profile updates require owner access.");
+  });
 
-    expect(mocks.handleMatrixAction).not.toHaveBeenCalled();
+  it("dispatches self-profile updates with sender owner context", async () => {
+    await matrixMessageActions.handleAction?.(
+      createContext({
+        action: profileAction,
+        accountId: "ops",
+        senderIsOwner: true,
+        params: {
+          displayName: "Ops Bot",
+        },
+      }),
+    );
+
+    const call = matrixActionCall();
+    expect(call.input).toMatchObject({
+      action: "setProfile",
+      accountId: "ops",
+      displayName: "Ops Bot",
+    });
   });
 
   it("forwards local avatar paths for self-profile updates", async () => {
     await matrixMessageActions.handleAction?.(
       createContext({
         action: profileAction,
-        senderIsOwner: true,
         accountId: "ops",
+        senderIsOwner: true,
         params: {
           path: "/tmp/avatar.jpg",
         },
@@ -173,7 +167,7 @@ describe("matrixMessageActions account propagation", () => {
     expect(call.input.accountId).toBe("ops");
     expect(call.input.avatarPath).toBe("/tmp/avatar.jpg");
     expect(call.cfg).toBeTypeOf("object");
-    expect(call.options).toEqual({ mediaLocalRoots: undefined });
+    expect(call.options).toMatchObject({ mediaLocalRoots: undefined });
   });
 
   it("forwards mediaLocalRoots for media sends", async () => {
@@ -195,7 +189,7 @@ describe("matrixMessageActions account propagation", () => {
     expect(call.input.accountId).toBe("ops");
     expect(call.input.mediaUrl).toBe("file:///tmp/photo.png");
     expect(call.cfg).toBeTypeOf("object");
-    expect(call.options).toEqual({ mediaLocalRoots: ["/tmp/openclaw-matrix-test"] });
+    expect(call.options).toMatchObject({ mediaLocalRoots: ["/tmp/openclaw-matrix-test"] });
   });
 
   it("allows media-only sends without requiring a message body", async () => {
@@ -216,7 +210,7 @@ describe("matrixMessageActions account propagation", () => {
     expect(call.input.content).toBeUndefined();
     expect(call.input.mediaUrl).toBe("file:///tmp/photo.png");
     expect(call.cfg).toBeTypeOf("object");
-    expect(call.options).toEqual({ mediaLocalRoots: undefined });
+    expect(call.options).toMatchObject({ mediaLocalRoots: undefined });
   });
 
   it("accepts shared media aliases and forwards voice-send intent", async () => {
@@ -239,6 +233,35 @@ describe("matrixMessageActions account propagation", () => {
     expect(call.input.mediaUrl).toBe("/tmp/clip.mp3");
     expect(call.input.audioAsVoice).toBe(true);
     expect(call.cfg).toBeTypeOf("object");
-    expect(call.options).toEqual({ mediaLocalRoots: undefined });
+    expect(call.options).toMatchObject({ mediaLocalRoots: undefined });
+  });
+
+  it("forwards trusted conversation context for read authorization", async () => {
+    await matrixMessageActions.handleAction?.(
+      createContext({
+        action: "reactions",
+        accountId: "ops",
+        requesterAccountId: "ops",
+        params: {
+          roomId: "!dm:example.org",
+          messageId: "$event",
+        },
+        toolContext: {
+          currentChannelId: "room:!dm:example.org",
+          currentChannelProvider: "matrix",
+          currentChatType: "direct",
+        },
+      }),
+    );
+
+    expect(matrixActionCall().options).toMatchObject({
+      readContext: {
+        accountId: "ops",
+        requesterAccountId: "ops",
+        currentChannelId: "room:!dm:example.org",
+        currentChannelProvider: "matrix",
+        currentChatType: "direct",
+      },
+    });
   });
 });

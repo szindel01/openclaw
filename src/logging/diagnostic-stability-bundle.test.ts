@@ -1,3 +1,4 @@
+// Diagnostic stability bundle tests cover stable diagnostic bundle generation.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -162,6 +163,21 @@ describe("diagnostic stability bundles", () => {
     expect(raw).not.toContain("stack");
   });
 
+  it("keeps bounded failure messages UTF-16 safe", () => {
+    const prefix = "a".repeat(499);
+    const result = writeDiagnosticStabilityBundleForFailureSync(
+      "gateway.restart_startup_failed",
+      new Error(`${prefix}😀${"b".repeat(500)}`),
+      { stateDir: tempDir },
+    );
+
+    expect(result.status).toBe("written");
+    if (result.status !== "written") {
+      return;
+    }
+    expect(readBundle(result.path).error?.message).toBe(`${prefix}...`);
+  });
+
   it("registers a fatal hook only while installed", () => {
     startDiagnosticStabilityRecorder();
     emitDiagnosticEvent({ type: "webhook.received", channel: "telegram" });
@@ -234,6 +250,26 @@ describe("diagnostic stability bundles", () => {
     Object.assign(bundle, {
       reason: "private reason token=secret",
       privateTopLevel: "top-level-secret",
+      evidence: {
+        memoryPressure: {
+          level: "critical",
+          reason: "rss_threshold",
+          memory: {
+            rssBytes: 4096,
+            heapTotalBytes: 2048,
+            heapUsedBytes: 1536,
+            externalBytes: 128,
+            arrayBuffersBytes: 64,
+          },
+          topSessionFiles: [
+            {
+              relativePath: "agents/main/sessions/raw-secret-session.jsonl",
+              sizeBytes: 4096,
+              mtimeMs: 1,
+            },
+          ],
+        },
+      },
       error: {
         name: "private error name",
         code: "ERR_TEST",
@@ -260,10 +296,20 @@ describe("diagnostic stability bundles", () => {
           chatId: "chat-id-secret",
           error: "event-error-secret",
         },
+        {
+          seq: 2,
+          ts: 2,
+          type: "exec.approval.followup_suppressed",
+          approvalId: "approval-imported-123",
+          reason: "session_rebound",
+          phase: "gateway_preflight",
+          command: "raw command secret",
+        },
       ],
       summary: {
         byType: {
           "webhook.error": 1,
+          "exec.approval.followup_suppressed": 1,
           "private summary type": 1,
         },
         privateSummary: "summary-secret",
@@ -282,13 +328,27 @@ describe("diagnostic stability bundles", () => {
     expect(result.bundle.error?.code).toBe("ERR_TEST");
     expect(result.bundle.error?.message).toContain("OPENAI_API_KEY=");
     expect(result.bundle.error?.message).not.toContain("sk-1234567890abcdef");
+    expect(result.bundle.evidence?.memoryPressure?.topSessionFiles?.[0]?.relativePath).toBe(
+      "agents/<agent>/sessions/<session>.jsonl",
+    );
     expect(result.bundle.snapshot.events[0]).toEqual({
       seq: 1,
       ts: 1,
       type: "webhook.error",
       channel: "telegram",
     });
-    expect(result.bundle.snapshot.summary.byType).toEqual({ "webhook.error": 1 });
+    expect(result.bundle.snapshot.events[1]).toEqual({
+      seq: 2,
+      ts: 2,
+      type: "exec.approval.followup_suppressed",
+      approvalId: "approval-imported-123",
+      reason: "session_rebound",
+      phase: "gateway_preflight",
+    });
+    expect(result.bundle.snapshot.summary.byType).toEqual({
+      "webhook.error": 1,
+      "exec.approval.followup_suppressed": 1,
+    });
     const sanitized = JSON.stringify(result.bundle);
     for (const secret of [
       "private reason",
@@ -300,8 +360,10 @@ describe("diagnostic stability bundles", () => {
       "host-extra-secret",
       "snapshot-secret",
       "private event reason",
+      "raw-secret-session",
       "chat-id-secret",
       "event-error-secret",
+      "raw command secret",
       "private summary type",
       "summary-secret",
     ]) {

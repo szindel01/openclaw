@@ -1,5 +1,9 @@
+// Active Memory tests cover config plugin behavior.
 import fs from "node:fs";
-import { type JsonSchemaObject, validateJsonSchemaValue } from "openclaw/plugin-sdk/config-schema";
+import {
+  type JsonSchemaObject,
+  validateJsonSchemaValue,
+} from "openclaw/plugin-sdk/json-schema-runtime";
 import { describe, expect, it } from "vitest";
 
 const manifest = JSON.parse(
@@ -20,6 +24,34 @@ describe("active-memory manifest config schema", () => {
     });
 
     expect(result.ok).toBe(true);
+  });
+
+  it.each([true, false, "auto"])("accepts fastMode=%s", (fastMode) => {
+    const result = validateJsonSchemaValue({
+      schema: manifest.configSchema,
+      cacheKey: `active-memory.manifest.fast-mode.${String(fastMode)}`,
+      value: {
+        enabled: true,
+        agents: ["main"],
+        fastMode,
+      },
+    });
+
+    expect(result.ok).toBe(true);
+  });
+
+  it("rejects unsupported fastMode strings", () => {
+    const result = validateJsonSchemaValue({
+      schema: manifest.configSchema,
+      cacheKey: "active-memory.manifest.fast-mode.invalid",
+      value: {
+        enabled: true,
+        agents: ["main"],
+        fastMode: "on",
+      },
+    });
+
+    expect(result.ok).toBe(false);
   });
 
   it("accepts custom toolsAllow entries", () => {

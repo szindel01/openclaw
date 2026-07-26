@@ -1,4 +1,7 @@
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+// Covers message channel selection from explicit input, tool context fallback,
+// configured accounts, and missing official external plugin repair hints.
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { defaultRuntime } from "../../runtime.js";
 
 const mocks = vi.hoisted(() => ({
   listChannelPlugins: vi.fn(),
@@ -48,16 +51,12 @@ vi.mock("../../plugins/official-external-plugin-repair-hints.js", () => ({
 }));
 
 type ChannelSelectionModule = typeof import("./channel-selection.js");
-type RuntimeModule = typeof import("../../runtime.js");
 
-let __testing: ChannelSelectionModule["__testing"];
 let listConfiguredMessageChannels: ChannelSelectionModule["listConfiguredMessageChannels"];
 let resolveMessageChannelSelection: ChannelSelectionModule["resolveMessageChannelSelection"];
-let runtimeModule: RuntimeModule;
 
 beforeAll(async () => {
-  runtimeModule = await import("../../runtime.js");
-  ({ __testing, listConfiguredMessageChannels, resolveMessageChannelSelection } =
+  ({ listConfiguredMessageChannels, resolveMessageChannelSelection } =
     await import("./channel-selection.js"));
 });
 
@@ -90,15 +89,17 @@ describe("listConfiguredMessageChannels", () => {
   let errorSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
-    errorSpy = vi.spyOn(runtimeModule.defaultRuntime, "error").mockImplementation(() => undefined);
+    errorSpy = vi.spyOn(defaultRuntime, "error").mockImplementation(() => undefined);
     mocks.listChannelPlugins.mockReset();
     mocks.listChannelPlugins.mockReturnValue([]);
     mocks.resolveOutboundChannelPlugin.mockReset();
     mocks.resolveOutboundChannelPlugin.mockImplementation(({ channel }: { channel: string }) => ({
       id: channel,
     }));
-    __testing.resetLoggedChannelSelectionErrors();
-    errorSpy.mockClear();
+  });
+
+  afterEach(() => {
+    errorSpy.mockRestore();
   });
 
   it.each([
@@ -158,6 +159,34 @@ describe("listConfiguredMessageChannels", () => {
     mocks.listChannelPlugins.mockReturnValue(plugins);
     await expect(listConfiguredMessageChannels({} as never)).resolves.toEqual(expected);
     expect(errorSpy).toHaveBeenCalledTimes(expectedErrors);
+  });
+
+  it("refreshes recent errors and re-logs errors evicted from the bounded dedupe", async () => {
+    const listWithAccounts = async (accountIds: string[]) => {
+      mocks.listChannelPlugins.mockReturnValue([
+        makePlugin({
+          id: "alpha",
+          accountIds,
+          resolveAccount: () => {
+            throw new Error("boom");
+          },
+        }),
+      ]);
+      await listConfiguredMessageChannels({} as never);
+    };
+
+    await listWithAccounts(Array.from({ length: 1024 }, (_, index) => `account-${index}`));
+    expect(errorSpy).toHaveBeenCalledTimes(1024);
+
+    await listWithAccounts(["account-0"]);
+    expect(errorSpy).toHaveBeenCalledTimes(1024);
+
+    await listWithAccounts(["account-overflow"]);
+    expect(errorSpy).toHaveBeenCalledTimes(1025);
+    await listWithAccounts(["account-0"]);
+    expect(errorSpy).toHaveBeenCalledTimes(1025);
+    await listWithAccounts(["account-1"]);
+    expect(errorSpy).toHaveBeenCalledTimes(1026);
   });
 });
 
@@ -243,6 +272,36 @@ describe("resolveMessageChannelSelection", () => {
     const setupResult = setup?.();
     await expect(expectResolvedSelection(params)).resolves.toEqual(expected);
     verify?.(setupResult as never);
+  });
+
+  it("allows bootstrap while checking explicit and fallback channels", async () => {
+    const cfg = {} as never;
+    mocks.resolveOutboundChannelPlugin.mockImplementation(({ channel }: { channel: string }) =>
+      channel === "beta" ? { id: "beta" } : undefined,
+    );
+
+    await expect(
+      expectResolvedSelection({
+        cfg,
+        channel: "alpha",
+        fallbackChannel: "beta",
+      }),
+    ).resolves.toEqual({
+      channel: "beta",
+      configured: [],
+      source: "tool-context-fallback",
+    });
+
+    expect(mocks.resolveOutboundChannelPlugin).toHaveBeenNthCalledWith(1, {
+      channel: "alpha",
+      cfg,
+      allowBootstrap: true,
+    });
+    expect(mocks.resolveOutboundChannelPlugin).toHaveBeenNthCalledWith(2, {
+      channel: "beta",
+      cfg,
+      allowBootstrap: true,
+    });
   });
 
   it.each([

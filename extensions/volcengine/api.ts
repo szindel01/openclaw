@@ -1,4 +1,6 @@
+// Volcengine API module exposes the plugin public contract.
 import type { ModelCompatConfig } from "openclaw/plugin-sdk/provider-model-shared";
+import { uniqueStrings } from "openclaw/plugin-sdk/string-coerce-runtime";
 
 export const VOLCENGINE_UNSUPPORTED_TOOL_SCHEMA_KEYWORDS = [
   "minLength",
@@ -10,7 +12,7 @@ export const VOLCENGINE_UNSUPPORTED_TOOL_SCHEMA_KEYWORDS = [
 ] as const;
 
 function mergeUnsupportedToolSchemaKeywords(existing: readonly string[] | undefined): string[] {
-  return Array.from(new Set([...(existing ?? []), ...VOLCENGINE_UNSUPPORTED_TOOL_SCHEMA_KEYWORDS]));
+  return uniqueStrings([...(existing ?? []), ...VOLCENGINE_UNSUPPORTED_TOOL_SCHEMA_KEYWORDS]);
 }
 
 export function resolveVolcengineToolSchemaCompatPatch(
@@ -48,7 +50,6 @@ export function applyVolcengineToolSchemaCompat<T extends { compat?: ModelCompat
 
 export { buildDoubaoCodingProvider, buildDoubaoProvider } from "./provider-catalog.js";
 export {
-  buildDoubaoModelDefinition,
   DOUBAO_BASE_URL,
   DOUBAO_CODING_BASE_URL,
   DOUBAO_CODING_MODEL_CATALOG,

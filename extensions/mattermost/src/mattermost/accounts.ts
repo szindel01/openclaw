@@ -1,4 +1,8 @@
-import { createAccountListHelpers } from "openclaw/plugin-sdk/account-helpers";
+// Mattermost plugin module implements accounts behavior.
+import {
+  createAccountListHelpers,
+  hasConfiguredAccountValue,
+} from "openclaw/plugin-sdk/account-helpers";
 import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 import { resolveMergedAccountConfig } from "openclaw/plugin-sdk/account-resolution";
 import {
@@ -7,7 +11,9 @@ import {
   resolveChannelStreamingChunkMode,
   resolveChannelPreviewStreamMode,
   type StreamingMode,
-} from "openclaw/plugin-sdk/channel-streaming";
+  type TextChunkMode,
+} from "openclaw/plugin-sdk/channel-outbound";
+import type { BlockStreamingCoalesceConfig } from "openclaw/plugin-sdk/config-contracts";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { normalizeResolvedSecretInputString, normalizeSecretInputString } from "../secret-input.js";
 import type {
@@ -35,13 +41,21 @@ export type ResolvedMattermostAccount = {
   oncharPrefixes?: string[];
   requireMention?: boolean;
   textChunkLimit?: number;
-  chunkMode?: MattermostAccountConfig["chunkMode"];
+  chunkMode?: TextChunkMode;
   streamingMode: StreamingMode;
   blockStreaming?: boolean;
-  blockStreamingCoalesce?: MattermostAccountConfig["blockStreamingCoalesce"];
+  blockStreamingCoalesce?: BlockStreamingCoalesceConfig;
 };
 
-const mattermostAccountHelpers = createAccountListHelpers("mattermost");
+const mattermostAccountHelpers = createAccountListHelpers("mattermost", {
+  hasImplicitDefaultAccount: (cfg) => {
+    const mattermost = cfg.channels?.mattermost;
+    return Boolean(
+      mattermost?.baseUrl?.trim() &&
+      (hasConfiguredAccountValue(mattermost.botToken) || process.env.MATTERMOST_BOT_TOKEN?.trim()),
+    );
+  },
+});
 
 export function listMattermostAccountIds(cfg: OpenClawConfig): string[] {
   return mattermostAccountHelpers.listAccountIds(cfg);
@@ -122,22 +136,25 @@ export function resolveMattermostAccount(params: {
     oncharPrefixes: merged.oncharPrefixes,
     requireMention,
     textChunkLimit: merged.textChunkLimit,
-    chunkMode: resolveChannelStreamingChunkMode(merged) ?? merged.chunkMode,
+    chunkMode: resolveChannelStreamingChunkMode(merged),
     streamingMode: resolveChannelPreviewStreamMode(merged, "partial"),
-    blockStreaming: resolveChannelStreamingBlockEnabled(merged) ?? merged.blockStreaming,
-    blockStreamingCoalesce:
-      resolveChannelStreamingBlockCoalesce(merged) ?? merged.blockStreamingCoalesce,
+    blockStreaming: resolveChannelStreamingBlockEnabled(merged),
+    blockStreamingCoalesce: resolveChannelStreamingBlockCoalesce(merged),
   };
 }
 
 /**
  * Resolve the effective replyToMode for a given chat type.
- * Mattermost auto-threading only applies to channel and group messages.
+ * Direct messages stay flat unless explicitly opted into a per-chat-type mode.
  */
 export function resolveMattermostReplyToMode(
   account: ResolvedMattermostAccount,
   kind: MattermostChatTypeKey,
 ): MattermostReplyToMode {
+  const scopedMode = account.config.replyToModeByChatType?.[kind];
+  if (scopedMode !== undefined) {
+    return scopedMode;
+  }
   if (kind === "direct") {
     return "off";
   }

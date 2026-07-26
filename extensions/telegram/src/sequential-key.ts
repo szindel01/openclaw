@@ -1,3 +1,4 @@
+// Telegram plugin module implements sequential key behavior.
 import type { Message, UserFromGetMe } from "grammy/types";
 import { parseExecApprovalCommandText } from "openclaw/plugin-sdk/approval-reply-runtime";
 import {
@@ -9,7 +10,23 @@ import {
   isAbortRequestText,
   isBtwRequestText,
 } from "openclaw/plugin-sdk/command-primitives-runtime";
-import { resolveTelegramForumThreadId } from "./bot/helpers.js";
+import {
+  resolveTelegramForumThreadId,
+  resolveTelegramMessageForumFlagHint,
+} from "./bot/helpers.js";
+import { parseTelegramQuestionCallbackData } from "./question-callback-data.js";
+
+const TELEGRAM_READ_ONLY_STATUS_COMMAND_KEYS = new Set([
+  "commands",
+  "context",
+  "help",
+  "status",
+  "tasks",
+  "tools",
+  "whoami",
+]);
+
+const TELEGRAM_ACTIVE_RUN_CONTROL_COMMAND_KEYS = new Set(["queue", "steer"]);
 
 type TelegramSequentialKeyContext = {
   chat?: { id?: number };
@@ -28,13 +45,12 @@ type TelegramSequentialKeyContext = {
   };
 };
 
-function resolveStatusCommandControlLane(params: {
+export function isTelegramReadOnlyControlLaneText(params: {
   rawText?: string;
   botUsername?: string;
 }): boolean {
-  // Only read-only status commands should bypass the per-topic lane. Commands
-  // like /export-session stay on the normal lane because they materialize
-  // session state to disk and should not interleave with an active turn.
+  // Only read-only status commands should bypass the per-topic lane.
+  // Diagnostics and export commands materialize state and should not interleave with an active turn.
   const normalizedBody = normalizeCommandBody(
     params.rawText?.trim() ?? "",
     params.botUsername ? { botUsername: params.botUsername } : undefined,
@@ -46,7 +62,7 @@ function resolveStatusCommandControlLane(params: {
   const command = listChatCommands().find((entry) =>
     entry.textAliases.some((candidate) => candidate.trim().toLowerCase() === alias),
   );
-  return command?.category === "status" && command.key !== "export-session";
+  return command?.category === "status" && TELEGRAM_READ_ONLY_STATUS_COMMAND_KEYS.has(command.key);
 }
 
 function isTelegramTargetedStopCommand(rawText?: string, botUsername?: string): boolean {
@@ -67,10 +83,51 @@ function isTelegramTargetedStopCommand(rawText?: string, botUsername?: string): 
   return match[1]?.toLowerCase() === normalizedBotUsername;
 }
 
-export function isTelegramControlLaneText(params: {
+function resolveTelegramCommandAliasForControlLane(
+  rawText?: string,
+  botUsername?: string,
+): string | undefined {
+  const trimmed = rawText?.trim();
+  if (!trimmed?.startsWith("/")) {
+    return undefined;
+  }
+
+  const targetedMatch = trimmed.match(
+    /^\/([A-Za-z0-9_-]+)(?:@([A-Za-z0-9_]+))?(?:$|\s|[.!?…,，。;；:：'"’”)\]}])/iu,
+  );
+  const targetBotUsername = targetedMatch?.[2]?.trim().toLowerCase();
+  const normalizedBotUsername = botUsername?.trim().toLowerCase();
+  if (targetBotUsername && normalizedBotUsername && targetBotUsername !== normalizedBotUsername) {
+    return undefined;
+  }
+
+  if (targetBotUsername && !normalizedBotUsername) {
+    const commandAlias = `/${targetedMatch?.[1]?.toLowerCase() ?? ""}`;
+    return commandAlias === "/" ? undefined : commandAlias;
+  }
+
+  return (
+    maybeResolveTextAlias(
+      normalizeCommandBody(trimmed, botUsername ? { botUsername } : undefined),
+    ) ?? undefined
+  );
+}
+
+function isTelegramActiveRunControlLaneText(params: {
   rawText?: string;
   botUsername?: string;
 }): boolean {
+  const alias = resolveTelegramCommandAliasForControlLane(params.rawText, params.botUsername);
+  if (!alias) {
+    return false;
+  }
+  const command = listChatCommands().find((entry) =>
+    entry.textAliases.some((candidate) => candidate.trim().toLowerCase() === alias),
+  );
+  return command ? TELEGRAM_ACTIVE_RUN_CONTROL_COMMAND_KEYS.has(command.key) : false;
+}
+
+function isTelegramControlLaneText(params: { rawText?: string; botUsername?: string }): boolean {
   if (
     isAbortRequestText(
       params.rawText,
@@ -82,7 +139,10 @@ export function isTelegramControlLaneText(params: {
   if (isTelegramTargetedStopCommand(params.rawText, params.botUsername)) {
     return true;
   }
-  return resolveStatusCommandControlLane(params);
+  if (isTelegramActiveRunControlLaneText(params)) {
+    return true;
+  }
+  return isTelegramReadOnlyControlLaneText(params);
 }
 
 export function getTelegramSequentialKey(ctx: TelegramSequentialKeyContext): string {
@@ -120,6 +180,12 @@ export function getTelegramSequentialKey(ctx: TelegramSequentialKeyContext): str
     return "telegram:btw";
   }
   const callbackData = ctx.update?.callback_query?.data;
+  if (parseTelegramQuestionCallbackData(callbackData)) {
+    if (typeof chatId === "number") {
+      return `telegram:${chatId}:question`;
+    }
+    return "telegram:question";
+  }
   if (callbackData && parseExecApprovalCommandText(callbackData) !== null) {
     if (typeof chatId === "number") {
       return `telegram:${chatId}:approval`;
@@ -128,8 +194,11 @@ export function getTelegramSequentialKey(ctx: TelegramSequentialKeyContext): str
   }
   const isGroup = msg?.chat?.type === "group" || msg?.chat?.type === "supergroup";
   const messageThreadId = msg?.message_thread_id;
-  const isForum =
-    msg?.chat?.is_forum ?? (msg?.chat?.type === "supergroup" && msg?.is_topic_message === true);
+  const isForum = resolveTelegramMessageForumFlagHint({
+    chatType: msg?.chat?.type,
+    isForum: msg?.chat?.is_forum,
+    isTopicMessage: msg?.is_topic_message,
+  });
   const threadId = isGroup
     ? resolveTelegramForumThreadId({ isForum, messageThreadId })
     : messageThreadId;

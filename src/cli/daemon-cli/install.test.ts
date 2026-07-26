@@ -1,7 +1,13 @@
+// Daemon install tests cover service install command behavior and plan handling.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ResolvedGatewayAuth } from "../../gateway/auth.js";
 import { captureFullEnv } from "../../test-utils/env.js";
 import { createCliRuntimeCapture } from "../test-runtime-capture.js";
-import type { DaemonActionResponse } from "./response.js";
+import type { createDaemonInstallActionContext } from "./shared.js";
+
+type DaemonActionResponse = Parameters<
+  ReturnType<typeof createDaemonInstallActionContext>["emit"]
+>[0];
 
 const resolveNodeStartupTlsEnvironmentMock = vi.hoisted(() => vi.fn());
 const loadConfigMock = vi.hoisted(() => vi.fn());
@@ -21,13 +27,14 @@ const hasConfiguredSecretInputMock = vi.hoisted(() =>
   }),
 );
 const resolveGatewayAuthMock = vi.hoisted(() =>
-  vi.fn(() => ({
+  vi.fn<() => ResolvedGatewayAuth>(() => ({
     mode: "token",
     token: undefined,
     password: undefined,
     allowTailscale: false,
   })),
 );
+const resolveGatewayBindHostMock = vi.hoisted(() => vi.fn(async () => "127.0.0.1"));
 const resolveSecretRefValuesMock = vi.hoisted(() => vi.fn());
 const randomTokenMock = vi.hoisted(() => vi.fn(() => "generated-token"));
 const createInstallPlanFixture = vi.hoisted(() => {
@@ -90,6 +97,10 @@ vi.mock("../../config/io.js", () => ({
   })),
 }));
 
+vi.mock("../../config/mutate.js", () => ({
+  replaceConfigFile: replaceConfigFileMock,
+}));
+
 vi.mock("../../config/paths.js", () => ({
   resolveGatewayPort: resolveGatewayPortMock,
   resolveIsNixMode: resolveIsNixModeMock,
@@ -112,6 +123,14 @@ vi.mock("../../config/types.secrets.js", () => ({
 vi.mock("../../gateway/auth.js", () => ({
   resolveGatewayAuth: resolveGatewayAuthMock,
 }));
+
+vi.mock("../../gateway/net.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../gateway/net.js")>();
+  return {
+    ...actual,
+    resolveGatewayBindHost: resolveGatewayBindHostMock,
+  };
+});
 
 vi.mock("../../secrets/resolve.js", () => ({
   resolveSecretRefValues: resolveSecretRefValuesMock,
@@ -197,13 +216,13 @@ function readFirstInstallPlanArg(): Record<string, unknown> {
 }
 
 function readFirstConfigWriteParams(): {
-  nextConfig?: { gateway?: { auth?: { token?: string } } };
+  nextConfig?: { gateway?: { mode?: string; auth?: { token?: string } } };
 } {
   const [params] = replaceConfigFileMock.mock.calls[0] ?? [];
   if (!params || typeof params !== "object") {
     throw new Error("expected first config write params");
   }
-  return params as { nextConfig?: { gateway?: { auth?: { token?: string } } } };
+  return params as { nextConfig?: { gateway?: { mode?: string; auth?: { token?: string } } } };
 }
 
 function readFirstNodeStartupTlsEnvironmentArg(): Record<string, unknown> {
@@ -227,8 +246,29 @@ function mockResolvedGatewayTokenSecretRef() {
   );
 }
 
-const { runDaemonInstall } = await import("./install.js");
+const { mergeInstallInvocationEnv, runDaemonInstall } = await import("./install.js");
 const envSnapshot = captureFullEnv();
+
+describe("mergeInstallInvocationEnv", () => {
+  it("canonicalizes Windows install env keys while filtering dangerous loader env", () => {
+    const env = mergeInstallInvocationEnv({
+      env: {
+        Path: "C:\\Windows\\System32",
+        openai_api_key: "service-openai-key",
+        NODE_OPTIONS: "--require C:\\temp\\untrusted.js",
+      },
+      platform: "win32",
+    });
+
+    expectFields(env, {
+      PATH: "C:\\Windows\\System32",
+      OPENAI_API_KEY: "service-openai-key",
+    });
+    expect(env.Path).toBeUndefined();
+    expect(env.openai_api_key).toBeUndefined();
+    expect(env.NODE_OPTIONS).toBeUndefined();
+  });
+});
 
 describe("runDaemonInstall", () => {
   beforeEach(() => {
@@ -240,6 +280,7 @@ describe("runDaemonInstall", () => {
     resolveIsNixModeMock.mockReset();
     resolveSecretInputRefMock.mockReset();
     resolveGatewayAuthMock.mockReset();
+    resolveGatewayBindHostMock.mockReset();
     resolveSecretRefValuesMock.mockReset();
     randomTokenMock.mockReset();
     buildGatewayInstallPlanMock.mockReset();
@@ -255,12 +296,12 @@ describe("runDaemonInstall", () => {
     actionState.emitted.length = 0;
     actionState.failed.length = 0;
 
-    loadConfigMock.mockReturnValue({ gateway: { auth: { mode: "token" } } });
+    loadConfigMock.mockReturnValue({ gateway: { mode: "local", auth: { mode: "token" } } });
     readConfigFileSnapshotMock.mockResolvedValue({
       exists: false,
       valid: true,
       config: {},
-      sourceConfig: { gateway: { auth: { mode: "token" } } },
+      sourceConfig: { gateway: { mode: "local", auth: { mode: "token" } } },
     });
     resolveGatewayPortMock.mockReturnValue(18789);
     resolveIsNixModeMock.mockReturnValue(false);
@@ -271,6 +312,7 @@ describe("runDaemonInstall", () => {
       password: undefined,
       allowTailscale: false,
     });
+    resolveGatewayBindHostMock.mockResolvedValue("127.0.0.1");
     resolveSecretRefValuesMock.mockResolvedValue(new Map());
     randomTokenMock.mockReturnValue("generated-token");
     buildGatewayInstallPlanMock.mockImplementation(createInstallPlanFixture);
@@ -303,6 +345,20 @@ describe("runDaemonInstall", () => {
     expect(actionState.failed[0]?.message).toContain("gateway.auth.token SecretRef is configured");
     expect(actionState.failed[0]?.message).toContain("unresolved");
     expect(buildGatewayInstallPlanMock).not.toHaveBeenCalled();
+    expect(installDaemonServiceAndEmitMock).not.toHaveBeenCalled();
+  });
+
+  it("blocks external-supervisor installs before reading or mutating config", async () => {
+    process.env.OPENCLAW_SUPERVISOR_MODE = "external";
+
+    await runDaemonInstall({ json: true });
+
+    expect(actionState.failed[0]?.message).toContain(
+      "gateway lifecycle is managed by an external supervisor",
+    );
+    expect(readConfigFileSnapshotMock).not.toHaveBeenCalled();
+    expect(replaceConfigFileMock).not.toHaveBeenCalled();
+    expect(service.isLoaded).not.toHaveBeenCalled();
     expect(installDaemonServiceAndEmitMock).not.toHaveBeenCalled();
   });
 
@@ -361,6 +417,23 @@ describe("runDaemonInstall", () => {
     });
   });
 
+  it("captures service install warnings in json install output", async () => {
+    installDaemonServiceAndEmitMock.mockImplementationOnce(async (params?: unknown) => {
+      await (params as { install: () => Promise<void> }).install();
+    });
+    service.install.mockImplementationOnce(async (args?: unknown) => {
+      (args as { warn?: (message: string) => void }).warn?.(
+        "Existing generated LaunchAgent env wrapper contains custom behavior and will be overwritten.",
+      );
+    });
+
+    await runDaemonInstall({ json: true, force: true });
+
+    expect(actionState.warnings).toContain(
+      "Existing generated LaunchAgent env wrapper contains custom behavior and will be overwritten.",
+    );
+  });
+
   it("does not treat env-template gateway.auth.token as plaintext during install", async () => {
     loadConfigMock.mockReturnValue({
       gateway: { auth: { mode: "token", token: "${OPENCLAW_GATEWAY_TOKEN}" } },
@@ -381,7 +454,7 @@ describe("runDaemonInstall", () => {
       exists: true,
       valid: true,
       config: { gateway: { auth: { mode: "token" } } },
-      sourceConfig: { gateway: { auth: { mode: "token" } } },
+      sourceConfig: { gateway: { mode: "local", auth: { mode: "token" } } },
     });
 
     await runDaemonInstall({ json: true });
@@ -394,6 +467,201 @@ describe("runDaemonInstall", () => {
     expectFirstInstallPlanCallOmitsToken();
     expect(installDaemonServiceAndEmitMock).toHaveBeenCalledTimes(1);
     expect(actionState.warnings.join("\n")).toContain("Auto-generated");
+  });
+
+  it("persists local gateway mode when installing from config missing gateway.mode", async () => {
+    readConfigFileSnapshotMock
+      .mockResolvedValueOnce({
+        exists: true,
+        valid: true,
+        config: { gateway: { auth: { mode: "token", token: "durable-token" } } },
+        sourceConfig: { gateway: { auth: { mode: "token", token: "durable-token" } } },
+      })
+      .mockResolvedValue({
+        exists: true,
+        valid: true,
+        config: {
+          gateway: { mode: "local", auth: { mode: "token", token: "durable-token" } },
+        },
+        sourceConfig: {
+          gateway: { mode: "local", auth: { mode: "token", token: "durable-token" } },
+        },
+      });
+    resolveGatewayAuthMock.mockReturnValue({
+      mode: "token",
+      token: "durable-token",
+      password: undefined,
+      allowTailscale: false,
+    });
+
+    await runDaemonInstall({ json: true });
+
+    expect(actionState.failed).toStrictEqual([]);
+    expect(replaceConfigFileMock).toHaveBeenCalledTimes(1);
+    expect(readFirstConfigWriteParams().nextConfig?.gateway?.mode).toBe("local");
+    expect(actionState.warnings).toContain(
+      "No gateway.mode found. Set gateway.mode=local for managed gateway install.",
+    );
+    expectFields(readFirstInstallPlanArg().config as Record<string, unknown>, {
+      gateway: {
+        mode: "local",
+        auth: { mode: "token", token: "durable-token" },
+      },
+    });
+  });
+
+  it("blocks managed install when explicit no-auth would bind to LAN", async () => {
+    const config = {
+      gateway: {
+        mode: "local",
+        bind: "lan",
+        auth: {
+          mode: "none",
+          token: "test-token",
+        },
+      },
+    };
+    readConfigFileSnapshotMock.mockResolvedValue({
+      exists: true,
+      valid: true,
+      config,
+      sourceConfig: config,
+    });
+    resolveGatewayAuthMock.mockReturnValue({
+      mode: "none",
+      token: "test-token",
+      password: undefined,
+      allowTailscale: false,
+    });
+    resolveGatewayBindHostMock.mockResolvedValue("0.0.0.0");
+
+    await runDaemonInstall({ json: true });
+
+    expect(actionState.failed[0]?.message).toContain("Gateway install blocked");
+    expect(actionState.failed[0]?.message).toContain("gateway.bind=lan");
+    expect(actionState.failed[0]?.message).toContain("gateway.auth.mode=none");
+    expect(actionState.failed[0]?.message).toContain("openclaw config set gateway.auth.mode token");
+    expect(buildGatewayInstallPlanMock).not.toHaveBeenCalled();
+    expect(installDaemonServiceAndEmitMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      name: "custom bind resolving to a network interface",
+      bind: "custom" as const,
+      customBindHost: "192.168.1.20",
+      resolvedHost: "192.168.1.20",
+      blocked: true,
+      message: undefined,
+    },
+    {
+      name: "tailnet bind resolving to a tailnet interface",
+      bind: "tailnet" as const,
+      customBindHost: undefined,
+      resolvedHost: "100.64.0.20",
+      blocked: true,
+      message: undefined,
+    },
+    {
+      name: "tailnet bind falling back to loopback",
+      bind: "tailnet" as const,
+      customBindHost: undefined,
+      resolvedHost: "127.0.0.1",
+      blocked: true,
+      message: "can later resolve to a Tailnet interface",
+    },
+    {
+      name: "loopback bind",
+      bind: "loopback" as const,
+      customBindHost: undefined,
+      resolvedHost: "127.0.0.1",
+      blocked: false,
+      message: undefined,
+    },
+  ])("handles explicit no-auth for $name", async (testCase) => {
+    const config = {
+      gateway: {
+        mode: "local" as const,
+        bind: testCase.bind,
+        customBindHost: testCase.customBindHost,
+        auth: { mode: "none" as const },
+      },
+    };
+    readConfigFileSnapshotMock.mockResolvedValue({
+      exists: true,
+      valid: true,
+      config,
+      sourceConfig: config,
+    });
+    resolveGatewayAuthMock.mockReturnValue({
+      mode: "none",
+      token: undefined,
+      password: undefined,
+      allowTailscale: false,
+    });
+    resolveGatewayBindHostMock.mockResolvedValue(testCase.resolvedHost);
+
+    await runDaemonInstall({ json: true });
+
+    expect(resolveGatewayBindHostMock).toHaveBeenCalledWith(testCase.bind, testCase.customBindHost);
+    if (testCase.blocked) {
+      expect(actionState.failed[0]?.message).toContain(`gateway.bind=${testCase.bind}`);
+      if (testCase.message) {
+        expect(actionState.failed[0]?.message).toContain(testCase.message);
+      }
+      expect(buildGatewayInstallPlanMock).not.toHaveBeenCalled();
+      expect(installDaemonServiceAndEmitMock).not.toHaveBeenCalled();
+    } else {
+      expect(actionState.failed).toStrictEqual([]);
+      expect(buildGatewayInstallPlanMock).toHaveBeenCalledTimes(1);
+      expect(installDaemonServiceAndEmitMock).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("allows a managed LAN install with trusted-proxy auth", async () => {
+    const config = {
+      gateway: {
+        mode: "local" as const,
+        bind: "lan" as const,
+        trustedProxies: ["127.0.0.1"],
+        auth: { mode: "trusted-proxy" as const },
+      },
+    };
+    readConfigFileSnapshotMock.mockResolvedValue({
+      exists: true,
+      valid: true,
+      config,
+      sourceConfig: config,
+    });
+    resolveGatewayAuthMock.mockReturnValue({
+      mode: "trusted-proxy",
+      token: undefined,
+      password: undefined,
+      allowTailscale: false,
+    });
+    resolveGatewayBindHostMock.mockResolvedValue("0.0.0.0");
+
+    await runDaemonInstall({ json: true });
+
+    expect(actionState.failed).toStrictEqual([]);
+    expect(buildGatewayInstallPlanMock).toHaveBeenCalledTimes(1);
+    expect(installDaemonServiceAndEmitMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not persist gateway mode when runtime validation fails", async () => {
+    readConfigFileSnapshotMock.mockResolvedValue({
+      exists: true,
+      valid: true,
+      config: { gateway: { auth: { mode: "token", token: "durable-token" } } },
+      sourceConfig: { gateway: { auth: { mode: "token", token: "durable-token" } } },
+    });
+    isGatewayDaemonRuntimeMock.mockReturnValue(false);
+
+    await runDaemonInstall({ json: true, runtime: "bogus" });
+
+    expect(actionState.failed[0]?.message).toContain("Invalid --runtime");
+    expect(replaceConfigFileMock).not.toHaveBeenCalled();
+    expect(installDaemonServiceAndEmitMock).not.toHaveBeenCalled();
   });
 
   it("continues Linux install when service probe hits a non-fatal systemd bus failure", async () => {
@@ -605,7 +873,7 @@ describe("runDaemonInstall", () => {
       NODE_USE_SYSTEM_CA: undefined,
     }));
     service.readCommand.mockResolvedValue({
-      programArguments: ["/home/test/.nvm/versions/node/v22.18.0/bin/node", "dist/entry.js"],
+      programArguments: ["/home/test/.nvm/versions/node/v22.19.0/bin/node", "dist/entry.js"],
       environment: {},
     } as never);
 
@@ -613,7 +881,7 @@ describe("runDaemonInstall", () => {
 
     expect(installDaemonServiceAndEmitMock).toHaveBeenCalledTimes(1);
     expectFields(readFirstNodeStartupTlsEnvironmentArg(), {
-      execPath: "/home/test/.nvm/versions/node/v22.18.0/bin/node",
+      execPath: "/home/test/.nvm/versions/node/v22.19.0/bin/node",
     });
   });
 
@@ -626,7 +894,9 @@ describe("runDaemonInstall", () => {
       },
     } as never);
     const previous = process.env.OPENAI_API_KEY;
+    const previousNodeOptions = process.env.NODE_OPTIONS;
     delete process.env.OPENAI_API_KEY;
+    process.env.NODE_OPTIONS = "--require /tmp/untrusted.js";
     try {
       await runDaemonInstall({ json: true, force: true });
 
@@ -639,6 +909,11 @@ describe("runDaemonInstall", () => {
         delete process.env.OPENAI_API_KEY;
       } else {
         process.env.OPENAI_API_KEY = previous;
+      }
+      if (previousNodeOptions === undefined) {
+        delete process.env.NODE_OPTIONS;
+      } else {
+        process.env.NODE_OPTIONS = previousNodeOptions;
       }
     }
   });

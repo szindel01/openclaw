@@ -241,21 +241,28 @@ write_update_restart_service_auth_env() {
 prepare_update_restart_probe_current_install() {
   local port="$1"
   local log_file="$2"
+  local command_timeout="${OPENCLAW_UPGRADE_SURVIVOR_COMMAND_TIMEOUT:-900s}"
+  local doctor_log="${log_file}.doctor"
   local start_epoch
   local ready_epoch
 
   echo "Preparing candidate-auth gateway for automatic update restart."
   install_update_restart_systemctl_shim
   seed_update_restart_probe_device_auth
+  if ! openclaw_e2e_maybe_timeout "$command_timeout" openclaw doctor --fix --non-interactive >"$doctor_log" 2>&1; then
+    echo "candidate device identity migration failed" >&2
+    cat "$doctor_log" >&2 || true
+    return 1
+  fi
   start_epoch="$(node -e "process.stdout.write(String(Date.now()))")"
   env -u OPENCLAW_GATEWAY_TOKEN -u OPENCLAW_GATEWAY_PASSWORD openclaw gateway --port "$port" --bind loopback --allow-unconfigured >"$log_file" 2>&1 &
   gateway_pid="$!"
   printf '%s\n' "$gateway_pid" >"$OPENCLAW_UPGRADE_SURVIVOR_SYSTEMCTL_SHIM_PID_FILE"
-  openclaw_e2e_wait_gateway_ready "$gateway_pid" "$log_file" 360
+  openclaw_e2e_wait_gateway_ready "$gateway_pid" "$log_file" 360 "$port"
   ready_epoch="$(node -e "process.stdout.write(String(Date.now()))")"
   start_seconds=$(((ready_epoch - start_epoch + 999) / 1000))
   write_update_restart_service_auth_env
-  if ! env -u OPENCLAW_GATEWAY_TOKEN -u OPENCLAW_GATEWAY_PASSWORD openclaw gateway install --force --json >"$OPENCLAW_UPGRADE_SURVIVOR_BASELINE_SERVICE_INSTALL_JSON" 2>"$OPENCLAW_UPGRADE_SURVIVOR_BASELINE_SERVICE_INSTALL_ERR"; then
+  if ! openclaw_e2e_maybe_timeout "$command_timeout" env -u OPENCLAW_GATEWAY_TOKEN -u OPENCLAW_GATEWAY_PASSWORD openclaw gateway install --force --json >"$OPENCLAW_UPGRADE_SURVIVOR_BASELINE_SERVICE_INSTALL_JSON" 2>"$OPENCLAW_UPGRADE_SURVIVOR_BASELINE_SERVICE_INSTALL_ERR"; then
     echo "gateway service install failed" >&2
     cat "$OPENCLAW_UPGRADE_SURVIVOR_BASELINE_SERVICE_INSTALL_ERR" >&2 || true
     cat "$OPENCLAW_UPGRADE_SURVIVOR_BASELINE_SERVICE_INSTALL_JSON" >&2 || true

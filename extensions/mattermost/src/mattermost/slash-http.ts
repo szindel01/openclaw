@@ -6,8 +6,15 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { resolveHumanDelayConfig } from "openclaw/plugin-sdk/agent-runtime";
+import {
+  asDateTimestampMs,
+  resolveExpiresAtMsFromDurationMs,
+} from "openclaw/plugin-sdk/number-runtime";
+import { finalizeInboundContext } from "openclaw/plugin-sdk/reply-runtime";
 import { safeEqualSecret } from "openclaw/plugin-sdk/security-runtime";
 import { isPrivateNetworkOptInEnabled } from "openclaw/plugin-sdk/ssrf-runtime";
+import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import type { ResolvedMattermostAccount } from "../mattermost/accounts.js";
 import { getMattermostRuntime } from "../runtime.js";
 import {
@@ -27,7 +34,10 @@ import {
   authorizeMattermostCommandInvocation,
   normalizeMattermostAllowList,
 } from "./monitor-auth.js";
-import { deliverMattermostReplyPayload } from "./reply-delivery.js";
+import {
+  createMattermostReplyDeliveryBarrier,
+  deliverMattermostReplyPayload,
+} from "./reply-delivery.js";
 import {
   buildModelsProviderData,
   createChannelMessageReplyPipeline,
@@ -135,7 +145,7 @@ function isDeletedMattermostCommand(command: { delete_at?: number }): boolean {
 
 function sanitizeCommandLookupError(error: unknown): string {
   const raw = error instanceof Error ? error.message : String(error);
-  return raw
+  const sanitized = raw
     .replace(/[\r\n\t]/gu, " ")
     .replace(/https?:\/\/[^\s)\]}]+/giu, (urlText) => {
       try {
@@ -158,12 +168,12 @@ function sanitizeCommandLookupError(error: unknown): string {
     .replace(
       /\b(token|authorization|access_token|refresh_token|client_secret|botToken)\b(\s*["']?\s*(?:=|:)\s*["']?)[^"',\s;}]+/giu,
       "$1$2[redacted]",
-    )
-    .slice(0, 300);
+    );
+  return truncateUtf16Safe(sanitized, 300);
 }
 
 function sanitizeMattermostLogValue(value: string): string {
-  return value.replace(/[\r\n\t]/gu, " ").slice(0, 200);
+  return truncateUtf16Safe(value.replace(/[\r\n\t]/gu, " "), 200);
 }
 
 async function withCommandLookupTimeout<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T> {
@@ -182,12 +192,6 @@ function commandLookupKey(
   accountId: string,
 ): string {
   return `${client.apiBaseUrl}:${accountId}:${registered.teamId}:${registered.id}`;
-}
-
-export function resetMattermostSlashCommandValidationCacheForTests(): void {
-  commandLookupInflight.clear();
-  commandValidationFailureCache.clear();
-  commandValidationLookupRateLimit.clear();
 }
 
 export function clearMattermostSlashCommandValidationCacheForAccount(accountId: string): void {
@@ -209,8 +213,14 @@ export function clearMattermostSlashCommandValidationCacheForAccount(accountId: 
 }
 
 function sweepCommandValidationFailureCache(now = Date.now()): void {
+  const validNow = asDateTimestampMs(now);
+  if (validNow === undefined) {
+    commandValidationFailureCache.clear();
+    return;
+  }
   for (const [key, entry] of commandValidationFailureCache) {
-    if (entry.expiresAt <= now) {
+    const expiresAt = asDateTimestampMs(entry.expiresAt);
+    if (expiresAt === undefined || expiresAt <= validNow) {
       commandValidationFailureCache.delete(key);
     }
   }
@@ -225,11 +235,16 @@ function sweepCommandValidationFailureCache(now = Date.now()): void {
 
 function hasCachedCommandValidationFailure(key: string, now = Date.now()): boolean {
   sweepCommandValidationFailureCache(now);
+  const validNow = asDateTimestampMs(now);
+  if (validNow === undefined) {
+    return false;
+  }
   const cached = commandValidationFailureCache.get(key);
   if (!cached) {
     return false;
   }
-  if (cached.expiresAt > now) {
+  const expiresAt = asDateTimestampMs(cached.expiresAt);
+  if (expiresAt !== undefined && expiresAt > validNow) {
     return true;
   }
   commandValidationFailureCache.delete(key);
@@ -237,17 +252,31 @@ function hasCachedCommandValidationFailure(key: string, now = Date.now()): boole
 }
 
 function cacheCommandValidationFailure(key: string, accountId: string): void {
-  sweepCommandValidationFailureCache();
+  const now = Date.now();
+  sweepCommandValidationFailureCache(now);
+  const expiresAt = resolveExpiresAtMsFromDurationMs(COMMAND_VALIDATION_FAILURE_CACHE_MS, {
+    nowMs: now,
+  });
+  if (expiresAt === undefined) {
+    commandValidationFailureCache.delete(key);
+    return;
+  }
   commandValidationFailureCache.set(key, {
     accountId,
-    expiresAt: Date.now() + COMMAND_VALIDATION_FAILURE_CACHE_MS,
+    expiresAt,
   });
 }
 
 function sweepCommandValidationLookupRateLimit(now = Date.now()): void {
+  const validNow = asDateTimestampMs(now);
+  if (validNow === undefined) {
+    commandValidationLookupRateLimit.clear();
+    return;
+  }
   const staleAfterMs = COMMAND_VALIDATION_LOOKUP_REFILL_MS * COMMAND_VALIDATION_LOOKUP_BURST * 2;
   for (const [key, entry] of commandValidationLookupRateLimit) {
-    if (now - entry.updatedAt > staleAfterMs) {
+    const updatedAt = asDateTimestampMs(entry.updatedAt);
+    if (updatedAt === undefined || validNow - updatedAt > staleAfterMs) {
       commandValidationLookupRateLimit.delete(key);
     }
   }
@@ -265,7 +294,12 @@ function reserveCommandValidationLookup(params: {
   accountId: string;
   now?: number;
 }): { allowed: true } | { allowed: false; shouldLog: boolean } {
-  const now = params.now ?? Date.now();
+  const rawNow = params.now ?? Date.now();
+  const now = asDateTimestampMs(rawNow);
+  if (now === undefined) {
+    commandValidationLookupRateLimit.clear();
+    return { allowed: true };
+  }
   sweepCommandValidationLookupRateLimit(now);
   const existing = commandValidationLookupRateLimit.get(params.key);
   if (!existing) {
@@ -362,7 +396,7 @@ async function fetchCurrentMattermostCommand(params: {
   return await lookup;
 }
 
-export async function validateMattermostSlashCommandToken(params: {
+async function validateMattermostSlashCommandToken(params: {
   accountId: string;
   client: ReturnType<typeof createMattermostClient>;
   registeredCommand: MattermostRegisteredCommand;
@@ -798,7 +832,7 @@ async function handleSlashCommandAsync(params: {
   }
 
   // Build inbound context — the command text is the body
-  const ctxPayload = core.channel.reply.finalizeInboundContext({
+  const ctxPayload = finalizeInboundContext({
     Body: commandText,
     BodyForAgent: commandText,
     RawBody: commandText,
@@ -854,11 +888,19 @@ async function handleSlashCommandAsync(params: {
       },
     },
   });
-  const humanDelay = core.channel.reply.resolveHumanDelayConfig(cfg, route.agentId);
+  const humanDelay = resolveHumanDelayConfig(cfg, route.agentId);
+  const deliveryBarrier = createMattermostReplyDeliveryBarrier({
+    isDirect: kind === "direct",
+    dmRetryOptions: account.config.dmChannelRetry,
+  });
 
-  const { dispatcher, replyOptions, markDispatchIdle } =
-    core.channel.reply.createReplyDispatcherWithTyping({
+  await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+    ctx: ctxPayload,
+    cfg,
+    dispatcherOptions: {
       ...replyPipeline,
+      resolveFollowupAdmissionBarrierTimeoutPolicy: deliveryBarrier.resolveTimeoutPolicy,
+      onDeliverySettled: deliveryBarrier.markDeliverySettled,
       humanDelay,
       deliver: async (payload: ReplyPayload) => {
         await deliverMattermostReplyPayload({
@@ -871,6 +913,7 @@ async function handleSlashCommandAsync(params: {
           textLimit,
           tableMode,
           sendMessage: sendMessageMattermost,
+          onDmChannelResolution: deliveryBarrier.trackDmChannelResolution,
         });
         runtime.log?.(`delivered slash reply to ${to}`);
       },
@@ -879,25 +922,13 @@ async function handleSlashCommandAsync(params: {
           `mattermost slash ${info.kind} reply failed: ${sanitizeCommandLookupError(err)}`,
         );
       },
-      onReplyStart: typingCallbacks?.onReplyStart,
-    });
-
-  await core.channel.reply.withReplyDispatcher({
-    dispatcher,
-    onSettled: () => {
-      markDispatchIdle();
+      typingCallbacks,
     },
-    run: () =>
-      core.channel.reply.dispatchReplyFromConfig({
-        ctx: ctxPayload,
-        cfg,
-        dispatcher,
-        replyOptions: {
-          ...replyOptions,
-          disableBlockStreaming:
-            typeof account.blockStreaming === "boolean" ? !account.blockStreaming : undefined,
-          onModelSelected,
-        },
-      }),
+    replyOptions: {
+      disableBlockStreaming:
+        typeof account.blockStreaming === "boolean" ? !account.blockStreaming : undefined,
+      onModelSelected,
+    },
   });
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

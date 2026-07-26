@@ -1,3 +1,4 @@
+// Telegram plugin module implements status issues behavior.
 import type {
   ChannelAccountSnapshot,
   ChannelStatusIssue,
@@ -7,26 +8,25 @@ import {
   appendMatchMetadata,
   asString,
   isRecord,
+  readAccountStatusSnapshot,
   resolveEnabledConfiguredAccountId,
+  type AccountStatusSnapshot,
 } from "openclaw/plugin-sdk/status-helpers";
 
 const TELEGRAM_POLLING_CONNECT_GRACE_MS = 120_000;
 const TELEGRAM_POLLING_STALE_TRANSPORT_MS = 30 * 60_000;
 const TELEGRAM_WEBHOOK_CONNECT_GRACE_MS = 120_000;
 
-type TelegramAccountStatus = {
-  accountId?: unknown;
-  enabled?: unknown;
-  configured?: unknown;
-  running?: unknown;
-  connected?: unknown;
-  mode?: unknown;
-  lastStartAt?: unknown;
-  lastTransportActivityAt?: unknown;
-  lastError?: unknown;
-  allowUnmentionedGroups?: unknown;
-  audit?: unknown;
-};
+const TELEGRAM_ACCOUNT_STATUS_FIELDS = [
+  "mode",
+  "lastStartAt",
+  "lastTransportActivityAt",
+  "lastError",
+  "allowUnmentionedGroups",
+  "audit",
+] as const;
+
+type TelegramAccountStatus = AccountStatusSnapshot<(typeof TELEGRAM_ACCOUNT_STATUS_FIELDS)[number]>;
 
 type TelegramGroupMembershipAuditSummary = {
   unresolvedGroups?: number;
@@ -41,25 +41,6 @@ type TelegramGroupMembershipAuditSummary = {
   }>;
 };
 
-function readTelegramAccountStatus(value: ChannelAccountSnapshot): TelegramAccountStatus | null {
-  if (!isRecord(value)) {
-    return null;
-  }
-  return {
-    accountId: value.accountId,
-    enabled: value.enabled,
-    configured: value.configured,
-    running: value.running,
-    connected: value.connected,
-    mode: value.mode,
-    lastStartAt: value.lastStartAt,
-    lastTransportActivityAt: value.lastTransportActivityAt,
-    lastError: value.lastError,
-    allowUnmentionedGroups: value.allowUnmentionedGroups,
-    audit: value.audit,
-  };
-}
-
 function asFiniteNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -70,7 +51,11 @@ function appendTelegramRuntimeError(message: string, lastError: unknown): string
 }
 
 function isTelegramPollingBacklogStallError(lastError: unknown): boolean {
-  return Boolean(asString(lastError)?.includes("isolated polling spool backlog stalled"));
+  const error = asString(lastError);
+  return Boolean(
+    error?.includes("isolated polling spool backlog stalled") ||
+    error?.includes("isolated polling spool handler timed out"),
+  );
 }
 
 function collectTelegramPollingRuntimeIssues(params: {
@@ -205,7 +190,7 @@ export function collectTelegramStatusIssues(
 ): ChannelStatusIssue[] {
   const issues: ChannelStatusIssue[] = [];
   for (const entry of accounts) {
-    const account = readTelegramAccountStatus(entry);
+    const account = readAccountStatusSnapshot(entry, TELEGRAM_ACCOUNT_STATUS_FIELDS);
     if (!account) {
       continue;
     }

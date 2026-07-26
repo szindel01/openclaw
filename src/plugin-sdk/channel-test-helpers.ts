@@ -1,3 +1,4 @@
+// Channel test helper exports provide shared fixtures for plugin channel contract tests.
 export { createDirectoryTestRuntime, expectDirectorySurface } from "./test-helpers/directory.js";
 export { expectDirectoryIds, type DirectoryListFn } from "./test-helpers/directory-ids.js";
 export {
@@ -18,8 +19,6 @@ export {
   setActivePluginRegistry,
   type PluginHookRegistration,
 } from "./test-helpers/outbound-delivery.js";
-/** @deprecated Direct outbound delivery is runtime substrate; use channel message runtime helpers. */
-export { deliverOutboundPayloads } from "./test-helpers/outbound-delivery.js";
 export {
   createPluginRuntimeMediaMock,
   createPluginRuntimeMock,
@@ -51,4 +50,4 @@ export {
   formatLocalEnvelopeTimestamp,
 } from "./test-helpers/envelope-timestamp.js";
 export { expectPairingReplyText, extractPairingCode } from "./test-helpers/pairing-reply.js";
-export { stripAnsi } from "../terminal/ansi.js";
+export { stripAnsi } from "../../packages/terminal-core/src/ansi.js";

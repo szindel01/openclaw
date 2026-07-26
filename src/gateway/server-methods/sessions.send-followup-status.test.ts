@@ -1,9 +1,14 @@
+/**
+ * Tests follow-up session send status transitions and broadcasts.
+ */
+
+import { expectDefined } from "@openclaw/normalization-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { expectSubagentFollowupReactivation } from "./subagent-followup.test-helpers.js";
 import type { GatewayRequestContext, RespondFn } from "./types.js";
 
 const loadSessionEntryMock = vi.fn();
-const readSessionMessagesMock = vi.fn();
+const readSessionMessageCountAsyncMock = vi.fn();
 const loadGatewaySessionRowMock = vi.fn();
 const getLatestSubagentRunByChildSessionKeyMock = vi.fn();
 const replaceSubagentRunAfterSteerMock = vi.fn();
@@ -14,8 +19,17 @@ vi.mock("../session-utils.js", async () => {
   return {
     ...actual,
     loadSessionEntry: (...args: unknown[]) => loadSessionEntryMock(...args),
-    readSessionMessages: (...args: unknown[]) => readSessionMessagesMock(...args),
     loadGatewaySessionRow: (...args: unknown[]) => loadGatewaySessionRowMock(...args),
+  };
+});
+
+vi.mock("../session-transcript-readers.js", async () => {
+  const actual = await vi.importActual<typeof import("../session-transcript-readers.js")>(
+    "../session-transcript-readers.js",
+  );
+  return {
+    ...actual,
+    readSessionMessageCountAsync: (...args: unknown[]) => readSessionMessageCountAsyncMock(...args),
   };
 });
 
@@ -45,7 +59,7 @@ import { sessionsHandlers } from "./sessions.js";
 describe("sessions.send completed subagent follow-up status", () => {
   beforeEach(() => {
     loadSessionEntryMock.mockReset();
-    readSessionMessagesMock.mockReset();
+    readSessionMessageCountAsyncMock.mockReset().mockResolvedValue(0);
     loadGatewaySessionRowMock.mockReset();
     getLatestSubagentRunByChildSessionKeyMock.mockReset();
     replaceSubagentRunAfterSteerMock.mockReset();
@@ -74,7 +88,6 @@ describe("sessions.send completed subagent follow-up status", () => {
       storePath: "/tmp/sessions.json",
       entry: { sessionId: "sess-followup" },
     });
-    readSessionMessagesMock.mockReturnValue([]);
     getLatestSubagentRunByChildSessionKeyMock.mockReturnValue(completedRun);
     replaceSubagentRunAfterSteerMock.mockReturnValue(true);
     loadGatewaySessionRowMock.mockReturnValue({
@@ -97,7 +110,10 @@ describe("sessions.send completed subagent follow-up status", () => {
       getRuntimeConfig: () => ({}),
     } as unknown as GatewayRequestContext;
 
-    await sessionsHandlers["sessions.send"]({
+    await expectDefined(
+      sessionsHandlers["sessions.send"],
+      'sessionsHandlers["sessions.send"] test invariant',
+    )({
       req: { id: "req-1" } as never,
       params: {
         key: childSessionKey,
@@ -124,6 +140,60 @@ describe("sessions.send completed subagent follow-up status", () => {
       broadcastToConnIds,
       completedRun,
       childSessionKey,
+      task: "follow-up",
     });
   });
+
+  for (const method of ["sessions.send", "sessions.steer"] as const) {
+    it(`${method} passes selected-global agent scope through chat.send`, async () => {
+      const cfg = { agents: { list: [{ id: "main", default: true }, { id: "work" }] } };
+      loadSessionEntryMock.mockReturnValue({
+        cfg,
+        canonicalKey: "global",
+        storePath: "/tmp/work/sessions.json",
+        entry: { sessionId: "sess-work-global" },
+      });
+      loadGatewaySessionRowMock.mockReturnValue(null);
+      chatSendMock.mockImplementation(async ({ respond }: { respond: RespondFn }) => {
+        respond(true, { runId: "run-work", status: "started" }, undefined, undefined);
+      });
+
+      const respondMock = vi.fn();
+      const respond = respondMock as unknown as RespondFn;
+      const context = {
+        chatAbortControllers: new Map(),
+        broadcastToConnIds: vi.fn(),
+        getSessionEventSubscriberConnIds: () => new Set<string>(),
+        getRuntimeConfig: () => cfg,
+      } as unknown as GatewayRequestContext;
+
+      await expectDefined(
+        sessionsHandlers[method],
+        "sessionsHandlers[method] test invariant",
+      )({
+        req: { id: "req-1" } as never,
+        params: {
+          key: "global",
+          agentId: "work",
+          message: "follow-up",
+          idempotencyKey: "run-work",
+        },
+        respond,
+        context,
+        client: null,
+        isWebchatConnect: () => false,
+      });
+
+      expect(loadSessionEntryMock).toHaveBeenCalledWith("global", { agentId: "work" });
+      const chatSendCall = chatSendMock.mock.calls.at(0)?.[0] as
+        | { params?: Record<string, unknown> }
+        | undefined;
+      expect(chatSendCall?.params).toMatchObject({
+        sessionKey: "global",
+        agentId: "work",
+        message: "follow-up",
+      });
+      expect(respondMock.mock.calls.at(0)?.[0]).toBe(true);
+    });
+  }
 });

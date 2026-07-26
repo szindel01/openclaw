@@ -1,3 +1,4 @@
+// ACPX tests cover config plugin behavior.
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -7,8 +8,12 @@ import { resolveAcpxPluginConfig, resolveAcpxPluginRoot } from "./config.js";
 const requireFromTest = createRequire(import.meta.url);
 const TSX_IMPORT = requireFromTest.resolve("tsx");
 
-function expectedSourceMcpServerArgs(entrypoint: string): string[] {
-  return ["--import", TSX_IMPORT, path.resolve(entrypoint)];
+function expectedMcpServerArgs(params: { sourceEntry: string; distEntry: string }): string[] {
+  const distEntry = path.resolve(params.distEntry);
+  if (fs.existsSync(distEntry)) {
+    return [distEntry];
+  }
+  return ["--import", TSX_IMPORT, path.resolve(params.sourceEntry)];
 }
 
 describe("embedded acpx plugin config", () => {
@@ -24,6 +29,7 @@ describe("embedded acpx plugin config", () => {
     expect(resolved.permissionMode).toBe("approve-reads");
     expect(resolved.nonInteractivePermissions).toBe("fail");
     expect(resolved.timeoutSeconds).toBe(120);
+    expect(resolved.probeAgent).toBeUndefined();
     expect(resolved.agents).toStrictEqual({});
   });
 
@@ -36,17 +42,6 @@ describe("embedded acpx plugin config", () => {
     });
 
     expect(resolved.timeoutSeconds).toBe(300);
-  });
-
-  it("keeps explicit probeAgent config", () => {
-    const resolved = resolveAcpxPluginConfig({
-      rawConfig: {
-        probeAgent: "claude",
-      },
-      workspaceDir: "/tmp/openclaw-acpx",
-    });
-
-    expect(resolved.probeAgent).toBe("claude");
   });
 
   it("accepts agent command overrides", () => {
@@ -122,16 +117,7 @@ describe("embedded acpx plugin config", () => {
     });
   });
 
-  it("leaves probeAgent undefined by default so the runtime picks its built-in probe agent", () => {
-    const resolved = resolveAcpxPluginConfig({
-      rawConfig: undefined,
-      workspaceDir: "/tmp/openclaw-acpx",
-    });
-
-    expect(resolved.probeAgent).toBeUndefined();
-  });
-
-  it("carries an explicit probeAgent through to the resolved plugin config, trimmed and lowercased", () => {
+  it("carries an explicit probeAgent through to the resolved plugin config, trimmed", () => {
     const resolved = resolveAcpxPluginConfig({
       rawConfig: {
         probeAgent: "  OpenCode  ",
@@ -139,7 +125,7 @@ describe("embedded acpx plugin config", () => {
       workspaceDir: "/tmp/openclaw-acpx",
     });
 
-    expect(resolved.probeAgent).toBe("opencode");
+    expect(resolved.probeAgent).toBe("OpenCode");
   });
 
   it("rejects an empty probeAgent string", () => {
@@ -164,7 +150,10 @@ describe("embedded acpx plugin config", () => {
     const server = resolved.mcpServers["openclaw-plugin-tools"];
     expect(server).toEqual({
       command: process.execPath,
-      args: expectedSourceMcpServerArgs("src/mcp/plugin-tools-serve.ts"),
+      args: expectedMcpServerArgs({
+        sourceEntry: "src/mcp/plugin-tools-serve.ts",
+        distEntry: "dist/mcp/plugin-tools-serve.js",
+      }),
     });
   });
 
@@ -179,7 +168,10 @@ describe("embedded acpx plugin config", () => {
     const server = resolved.mcpServers["openclaw-tools"];
     expect(server).toEqual({
       command: process.execPath,
-      args: expectedSourceMcpServerArgs("src/mcp/openclaw-tools-serve.ts"),
+      args: expectedMcpServerArgs({
+        sourceEntry: "src/mcp/openclaw-tools-serve.ts",
+        distEntry: "dist/mcp/openclaw-tools-serve.js",
+      }),
     });
   });
 
@@ -233,6 +225,16 @@ describe("embedded acpx plugin config", () => {
         queueOwnerTtlSeconds: {
           type: "number",
           minimum: 0,
+        },
+        piSessionCatalog: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            enabled: {
+              type: "boolean",
+              default: true,
+            },
+          },
         },
         probeAgent: {
           type: "string",

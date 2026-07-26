@@ -1,10 +1,13 @@
+// Zai plugin entrypoint registers its OpenClaw integration.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   definePluginEntry,
   type ProviderAuthContext,
   type ProviderAuthMethod,
   type ProviderAuthMethodNonInteractiveContext,
   type ProviderResolveDynamicModelContext,
-  type ProviderRuntimeModel,
   type ProviderWrapStreamFnContext,
 } from "openclaw/plugin-sdk/plugin-entry";
 import {
@@ -14,66 +17,106 @@ import {
   normalizeApiKeyInput,
   normalizeOptionalSecretInput,
   type SecretInput,
-  upsertAuthProfile,
+  upsertAuthProfileWithLock,
   validateApiKeyInput,
 } from "openclaw/plugin-sdk/provider-auth-api-key";
+import { buildOpenAICompatibleProviderCatalog } from "openclaw/plugin-sdk/provider-catalog-live-runtime";
+import { buildManifestModelProviderConfig } from "openclaw/plugin-sdk/provider-catalog-shared";
 import {
   buildProviderReplayFamilyHooks,
-  normalizeModelCompat,
+  resolveFamilyForwardCompatModel,
 } from "openclaw/plugin-sdk/provider-model-shared";
 import {
   createPayloadPatchStreamWrapper,
   createToolStreamWrapper,
   defaultToolStreamExtraParams,
 } from "openclaw/plugin-sdk/provider-stream-shared";
-import { fetchZaiUsage, resolveLegacyPiAgentAccessToken } from "openclaw/plugin-sdk/provider-usage";
+import { fetchZaiUsage } from "openclaw/plugin-sdk/provider-usage";
 import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { detectZaiEndpoint, type ZaiEndpointId } from "./detect.js";
 import { zaiMediaUnderstandingProvider } from "./media-understanding-provider.js";
-import { buildZaiModelDefinition } from "./model-definitions.js";
-import { applyZaiConfig, applyZaiProviderConfig, ZAI_DEFAULT_MODEL_REF } from "./onboard.js";
+import { buildZaiModelDefinition, resolveZaiBaseUrl } from "./model-definitions.js";
+import { applyZaiConfig, applyZaiProviderConfig, resolveZaiModelId } from "./onboard.js";
+import manifest from "./openclaw.plugin.json" with { type: "json" };
+import { isGlm52ModelId, resolveThinkingProfile } from "./provider-policy-api.js";
 
 const PROVIDER_ID = "zai";
 const GLM5_TEMPLATE_MODEL_ID = "glm-4.7";
 const PROFILE_ID = "zai:default";
+type UpsertAuthProfileParams = Parameters<typeof upsertAuthProfileWithLock>[0];
 
-function resolveGlm5ForwardCompatModel(
-  ctx: ProviderResolveDynamicModelContext,
-): ProviderRuntimeModel | undefined {
-  const trimmedModelId = ctx.modelId.trim();
-  if (!normalizeLowercaseStringOrEmpty(trimmedModelId).startsWith("glm-5")) {
-    return undefined;
-  }
-
-  const existing = ctx.modelRegistry.find(
-    PROVIDER_ID,
-    trimmedModelId,
-  ) as ProviderRuntimeModel | null;
-  if (existing) {
-    return existing;
-  }
-
-  const def = buildZaiModelDefinition({ id: trimmedModelId });
-  const template = ctx.modelRegistry.find(
-    PROVIDER_ID,
-    GLM5_TEMPLATE_MODEL_ID,
-  ) as ProviderRuntimeModel | null;
-  return normalizeModelCompat({
-    ...template,
-    id: def.id,
-    name: def.name,
-    api: "openai-completions",
-    provider: PROVIDER_ID,
-    reasoning: def.reasoning,
-    input: def.input,
-    cost: def.cost,
-    contextWindow: def.contextWindow,
-    maxTokens: def.maxTokens,
-  } as ProviderRuntimeModel);
+function buildZaiCatalogProvider() {
+  return buildManifestModelProviderConfig({
+    providerId: PROVIDER_ID,
+    catalog: manifest.modelCatalog.providers.zai,
+  });
 }
 
-function resolveZaiDefaultModel(modelIdOverride?: string): string {
-  return modelIdOverride ? `zai/${modelIdOverride}` : ZAI_DEFAULT_MODEL_REF;
+function resolveDeprecatedPiAgentAuthPath(env: NodeJS.ProcessEnv): string {
+  const home = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir();
+  return path.join(home, ".pi", "agent", "auth.json");
+}
+
+function resolveDeprecatedPiAgentAccessToken(
+  env: NodeJS.ProcessEnv,
+  providerIds: readonly string[],
+): string | undefined {
+  try {
+    const authPath = resolveDeprecatedPiAgentAuthPath(env);
+    if (!fs.existsSync(authPath)) {
+      return undefined;
+    }
+    const parsed = JSON.parse(fs.readFileSync(authPath, "utf-8")) as Record<
+      string,
+      { access?: unknown }
+    >;
+    for (const providerId of providerIds) {
+      const token = parsed[providerId]?.access;
+      if (typeof token === "string" && token.trim()) {
+        return token;
+      }
+    }
+  } catch {}
+  return undefined;
+}
+
+async function upsertAuthProfileWithLockOrThrow(params: UpsertAuthProfileParams): Promise<void> {
+  const updated = await upsertAuthProfileWithLock(params);
+  if (!updated) {
+    throw new Error(
+      "Failed to update auth profile store; the auth store lock may be busy. Wait a moment and retry.",
+    );
+  }
+}
+
+function resolveGlm5ForwardCompatModel(ctx: ProviderResolveDynamicModelContext) {
+  return resolveFamilyForwardCompatModel({
+    providerId: PROVIDER_ID,
+    ctx,
+    cases: [
+      {
+        match: (id) => id.startsWith("glm-5"),
+        templateIds: [GLM5_TEMPLATE_MODEL_ID],
+        patch: ({ modelId, template }) => {
+          const def = buildZaiModelDefinition({ id: modelId });
+          return {
+            name: def.name,
+            // Native models must never fall through to the OpenAI SDK's default host.
+            baseUrl: ctx.providerConfig?.baseUrl ?? template?.baseUrl ?? resolveZaiBaseUrl(),
+            api: "openai-completions",
+            provider: PROVIDER_ID,
+            reasoning: def.reasoning,
+            input: def.input as ("text" | "image")[],
+            cost: def.cost,
+            contextWindow: def.contextWindow,
+            maxTokens: def.maxTokens,
+          };
+        },
+      },
+    ],
+    preserveExisting: true,
+    synthesize: true,
+  });
 }
 
 function isTrueParam(value: unknown): boolean {
@@ -88,11 +131,31 @@ function isDisabledThinkingLevel(thinkingLevel: ProviderWrapStreamFnContext["thi
   return thinkingLevel === "off";
 }
 
+function mapThinkingLevelToZaiReasoningEffort(
+  thinkingLevel: ProviderWrapStreamFnContext["thinkingLevel"],
+): "high" | "max" | undefined {
+  switch (thinkingLevel) {
+    case "low":
+    case "medium":
+    case "high":
+    case "adaptive":
+      return "high";
+    case "xhigh":
+    case "max":
+      return "max";
+    default:
+      return undefined;
+  }
+}
+
 function wrapZaiStreamFn(ctx: ProviderWrapStreamFnContext) {
   let streamFn = createToolStreamWrapper(ctx.streamFn, ctx.extraParams?.tool_stream !== false);
   const preserveThinking = shouldPreserveZaiThinking(ctx.extraParams);
+  const reasoningEffort = isGlm52ModelId(ctx.modelId)
+    ? mapThinkingLevelToZaiReasoningEffort(ctx.thinkingLevel)
+    : undefined;
 
-  if (!isDisabledThinkingLevel(ctx.thinkingLevel) && !preserveThinking) {
+  if (!isDisabledThinkingLevel(ctx.thinkingLevel) && !preserveThinking && !reasoningEffort) {
     return streamFn;
   }
 
@@ -104,6 +167,10 @@ function wrapZaiStreamFn(ctx: ProviderWrapStreamFnContext) {
     if (isDisabledThinkingLevel(ctx.thinkingLevel)) {
       payload.thinking = { type: "disabled" };
       return;
+    }
+
+    if (reasoningEffort) {
+      payload.reasoning_effort = reasoningEffort;
     }
 
     if (preserveThinking) {
@@ -180,6 +247,10 @@ async function runZaiApiKeyAuth(
   const detected = await detectZaiEndpoint({ apiKey, ...(endpoint ? { endpoint } : {}) });
   const modelIdOverride = detected?.modelId;
   const nextEndpoint = detected?.endpoint ?? endpoint ?? (await promptForZaiEndpoint(ctx));
+  const preset = {
+    ...(nextEndpoint ? { endpoint: nextEndpoint } : {}),
+    ...(modelIdOverride ? { modelId: modelIdOverride } : {}),
+  };
   return {
     profiles: [
       {
@@ -192,11 +263,8 @@ async function runZaiApiKeyAuth(
         ),
       },
     ],
-    configPatch: applyZaiProviderConfig(ctx.config, {
-      ...(nextEndpoint ? { endpoint: nextEndpoint } : {}),
-      ...(modelIdOverride ? { modelId: modelIdOverride } : {}),
-    }),
-    defaultModel: resolveZaiDefaultModel(modelIdOverride),
+    configPatch: applyZaiProviderConfig(ctx.config, preset),
+    defaultModel: `zai/${resolveZaiModelId(preset)}`,
     ...(detected?.note ? { notes: [detected.note] } : {}),
   };
 }
@@ -229,7 +297,7 @@ async function runZaiApiKeyAuthNonInteractive(
     if (!credential) {
       return null;
     }
-    upsertAuthProfile({
+    await upsertAuthProfileWithLockOrThrow({
       profileId: PROFILE_ID,
       credential,
       agentDir: ctx.agentDir,
@@ -318,20 +386,32 @@ export default definePluginEntry({
           endpoint: "cn",
         }),
       ],
+      catalog: {
+        order: "simple",
+        run: (ctx) =>
+          buildOpenAICompatibleProviderCatalog({
+            ctx,
+            providerId: PROVIDER_ID,
+            buildProvider: buildZaiCatalogProvider,
+            allowExplicitBaseUrl: true,
+          }),
+      },
+      staticCatalog: {
+        order: "simple",
+        run: async () => ({ provider: buildZaiCatalogProvider() }),
+      },
       resolveDynamicModel: (ctx) => resolveGlm5ForwardCompatModel(ctx),
+      matchesContextOverflowError: ({ errorMessage }) =>
+        /\b(?:tokens? in request more than max tokens? allowed|prompt exceeds max(?:imum)? length)\b/i.test(
+          errorMessage,
+        ),
       ...buildProviderReplayFamilyHooks({
         family: "openai-compatible",
         dropReasoningFromHistory: false,
       }),
       prepareExtraParams: (ctx) => defaultToolStreamExtraParams(ctx.extraParams),
       wrapStreamFn: (ctx) => wrapZaiStreamFn(ctx),
-      resolveThinkingProfile: () => ({
-        levels: [
-          { id: "off", label: "off" },
-          { id: "low", label: "on" },
-        ],
-        defaultLevel: "off",
-      }),
+      resolveThinkingProfile,
       isModernModelRef: ({ modelId }) => {
         const lower = normalizeLowercaseStringOrEmpty(modelId);
         return (
@@ -349,7 +429,7 @@ export default definePluginEntry({
         if (apiKey) {
           return { token: apiKey };
         }
-        const legacyToken = resolveLegacyPiAgentAccessToken(ctx.env, ["z-ai", "zai"]);
+        const legacyToken = resolveDeprecatedPiAgentAccessToken(ctx.env, ["z-ai", PROVIDER_ID]);
         return legacyToken ? { token: legacyToken } : null;
       },
       fetchUsageSnapshot: async (ctx) => await fetchZaiUsage(ctx.token, ctx.timeoutMs, ctx.fetchFn),

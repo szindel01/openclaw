@@ -1,4 +1,6 @@
+// Synology Chat tests cover core plugin behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { MAX_TIMER_TIMEOUT_MS } from "openclaw/plugin-sdk/number-runtime";
 import {
   createPluginSetupWizardConfigure,
   createTestWizardPrompter,
@@ -179,6 +181,17 @@ describe("synology-chat account resolution", () => {
     expect(listAccountIds(cfg)).toEqual(["default"]);
   });
 
+  it("does not list an implicit default account for a blank env token", () => {
+    process.env.SYNOLOGY_CHAT_TOKEN = "   ";
+    const cfg = {
+      channels: {
+        "synology-chat": { accounts: { office: {} } },
+      },
+    };
+
+    expect(listAccountIds(cfg)).toEqual(["office"]);
+  });
+
   it("lists named and default accounts together", () => {
     const cfg = {
       channels: {
@@ -210,17 +223,35 @@ describe("synology-chat account resolution", () => {
   });
 
   it("uses env var fallbacks", () => {
-    process.env.SYNOLOGY_CHAT_TOKEN = "env-tok";
-    process.env.SYNOLOGY_CHAT_INCOMING_URL = "https://nas/incoming";
-    process.env.SYNOLOGY_NAS_HOST = "192.0.2.1";
-    process.env.OPENCLAW_BOT_NAME = "TestBot";
+    const padded = "test-auth-token".padStart(16).padEnd(17);
+    vi.stubEnv("SYNOLOGY_CHAT_TOKEN", padded);
+    vi.stubEnv("SYNOLOGY_CHAT_INCOMING_URL", " https://nas/incoming ");
+    vi.stubEnv("SYNOLOGY_NAS_HOST", " 192.0.2.1 ");
+    vi.stubEnv("OPENCLAW_BOT_NAME", " TestBot ");
 
     const cfg = { channels: { "synology-chat": {} } };
     const account = resolveAccount(cfg);
-    expect(account.token).toBe("env-tok");
+    expect(account.token).toBe("test-auth-token");
     expect(account.incomingUrl).toBe("https://nas/incoming");
     expect(account.nasHost).toBe("192.0.2.1");
     expect(account.botName).toBe("TestBot");
+  });
+
+  it("ignores blank env var fallbacks when resolving the default account", () => {
+    const whitespace = "   ";
+    vi.stubEnv("SYNOLOGY_CHAT_TOKEN", whitespace);
+    vi.stubEnv("SYNOLOGY_CHAT_INCOMING_URL", whitespace);
+    vi.stubEnv("SYNOLOGY_NAS_HOST", whitespace);
+    vi.stubEnv("SYNOLOGY_ALLOWED_USER_IDS", whitespace);
+    vi.stubEnv("OPENCLAW_BOT_NAME", whitespace);
+
+    const account = resolveAccount({ channels: { "synology-chat": {} } });
+
+    expect(account.token).toBe("");
+    expect(account.incomingUrl).toBe("");
+    expect(account.nasHost).toBe("localhost");
+    expect(account.allowedUserIds).toEqual([]);
+    expect(account.botName).toBe("OpenClaw");
   });
 
   it("lets config and account overrides win over env/base config", () => {
@@ -324,6 +355,28 @@ describe("synology-chat account resolution", () => {
 
     process.env.SYNOLOGY_RATE_LIMIT = "0abc";
     expect(resolveAccount({ channels: { "synology-chat": {} } }).rateLimitPerMinute).toBe(30);
+
+    process.env.SYNOLOGY_RATE_LIMIT = "-1";
+    expect(resolveAccount({ channels: { "synology-chat": {} } }).rateLimitPerMinute).toBe(30);
+  });
+
+  it("ignores malformed configured rate limits", () => {
+    process.env.SYNOLOGY_RATE_LIMIT = "12";
+
+    expect(
+      resolveAccount({
+        channels: {
+          "synology-chat": { rateLimitPerMinute: -1 },
+        },
+      }).rateLimitPerMinute,
+    ).toBe(12);
+    expect(
+      resolveAccount({
+        channels: {
+          "synology-chat": { rateLimitPerMinute: 1.5 },
+        },
+      }).rateLimitPerMinute,
+    ).toBe(12);
   });
 });
 
@@ -409,6 +462,31 @@ describe("synology-chat security helpers", () => {
     expect(result).toContain("[truncated]");
   });
 
+  it("truncates long inputs without splitting a surrogate pair", () => {
+    const loneSurrogatePattern =
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
+    const input = "a".repeat(3999) + "\u{1F600}" + "b".repeat(2000);
+
+    const result = sanitizeInput(input);
+
+    expect(result).toContain("[truncated]");
+    expect(result).not.toMatch(loneSurrogatePattern);
+    expect(result).toBe(`${"a".repeat(3999)}... [truncated]`);
+  });
+
+  it("keeps complete supplementary-plane characters that fit before truncation", () => {
+    const loneSurrogatePattern =
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
+    const emoji = "\u{1F600}";
+    const input = "a".repeat(3998) + emoji + "b".repeat(2000);
+
+    const result = sanitizeInput(input);
+
+    expect(result).toContain("[truncated]");
+    expect(result.startsWith(`${"a".repeat(3998)}${emoji}`)).toBe(true);
+    expect(result).not.toMatch(loneSurrogatePattern);
+  });
+
   it("rate limits per user and caps tracked state", () => {
     const limiter = new RateLimiter(3, 60);
     expect(limiter.check("user1")).toBe(true);
@@ -423,5 +501,24 @@ describe("synology-chat security helpers", () => {
     expect(capped.check("user3")).toBe(true);
     expect(capped.check("user4")).toBe(true);
     expect(capped.size()).toBeLessThanOrEqual(3);
+  });
+
+  it("caps oversized rate limit windows before constructing the limiter", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    try {
+      const limiter = new RateLimiter(1, Number.MAX_SAFE_INTEGER);
+
+      expect(limiter.check("user1")).toBe(true);
+      expect(limiter.check("user1")).toBe(false);
+
+      vi.setSystemTime(MAX_TIMER_TIMEOUT_MS - 1);
+      expect(limiter.check("user1")).toBe(false);
+
+      vi.setSystemTime(MAX_TIMER_TIMEOUT_MS);
+      expect(limiter.check("user1")).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

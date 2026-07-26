@@ -1,8 +1,22 @@
+// Search setup tests cover search provider setup and config changes.
+
+import { expectDefined } from "@openclaw/normalization-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createWizardPrompter } from "../../test/helpers/wizard-prompter.js";
 import { createNonExitingRuntime } from "../runtime.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import { runSearchSetupFlow } from "./search-setup.js";
+
+const authMocks = vi.hoisted(() => ({
+  hasAuthProfileForProvider: vi.fn((_params: { provider: string; type?: string }) => false),
+}));
+const webSearchProviderMocks = vi.hoisted(() => ({
+  resolvePluginWebSearchProviders: vi.fn(),
+}));
+
+vi.mock("../agents/tools/model-config.helpers.js", () => ({
+  hasAuthProfileForProvider: authMocks.hasAuthProfileForProvider,
+}));
 
 const mockGrokProvider = vi.hoisted(() => ({
   id: "grok",
@@ -15,6 +29,7 @@ const mockGrokProvider = vi.hoisted(() => ({
   placeholder: "xai-...",
   signupUrl: "https://x.ai/api",
   envVars: ["XAI_API_KEY"],
+  authProviderId: "xai",
   onboardingScopes: ["text-inference"],
   credentialPath: "plugins.entries.xai.config.webSearch.apiKey",
   credentialNote: "Configure Grok web search prerequisites before entering the credential.",
@@ -64,7 +79,7 @@ const mockGrokProvider = vi.hoisted(() => ({
     }
     const model = await prompter.select({
       message: "Grok model",
-      options: [{ value: "grok-4-1-fast", label: "grok-4-1-fast" }],
+      options: [{ value: "grok-4.3", label: "grok-4.3" }],
     });
     const pluginEntries = (config.plugins as { entries?: Record<string, unknown> } | undefined)
       ?.entries;
@@ -94,8 +109,23 @@ const mockGrokProvider = vi.hoisted(() => ({
   },
 }));
 
+const mockCodexProvider = vi.hoisted(() => ({
+  id: "codex",
+  pluginId: "codex",
+  label: "Codex Hosted Search",
+  hint: "Grounded answers through your Codex app-server account",
+  docsUrl: "https://docs.openclaw.ai/tools/web",
+  requiresCredential: false,
+  credentialLabel: "Codex app-server account",
+  placeholder: "",
+  signupUrl: "https://chatgpt.com",
+  envVars: [],
+  onboardingScopes: ["text-inference"],
+  credentialPath: "",
+}));
+
 vi.mock("../plugins/web-search-providers.runtime.js", () => ({
-  resolvePluginWebSearchProviders: () => [mockGrokProvider],
+  resolvePluginWebSearchProviders: webSearchProviderMocks.resolvePluginWebSearchProviders,
 }));
 
 const ensureOnboardingPluginInstalled = vi.hoisted(() =>
@@ -158,11 +188,13 @@ function latestPluginInstallRequest(): {
 describe("runSearchSetupFlow", () => {
   beforeEach(() => {
     ensureOnboardingPluginInstalled.mockClear();
+    authMocks.hasAuthProfileForProvider.mockReset();
+    authMocks.hasAuthProfileForProvider.mockReturnValue(false);
+    webSearchProviderMocks.resolvePluginWebSearchProviders.mockReset();
+    webSearchProviderMocks.resolvePluginWebSearchProviders.mockReturnValue([mockGrokProvider]);
   });
 
   it("localizes setup copy for web search provider selection", async () => {
-    const previousLocale = process.env.OPENCLAW_LOCALE;
-    process.env.OPENCLAW_LOCALE = "zh-CN";
     const note = vi.fn(async () => {});
     const select = vi.fn().mockResolvedValueOnce("__skip__");
     const prompter = createWizardPrompter({
@@ -170,19 +202,13 @@ describe("runSearchSetupFlow", () => {
       select: select as never,
     });
 
-    try {
+    await withEnvAsync({ OPENCLAW_LOCALE: "zh-CN" }, async () => {
       await runSearchSetupFlow(
         { plugins: { allow: ["xai"] } },
         createNonExitingRuntime(),
         prompter,
       );
-    } finally {
-      if (previousLocale === undefined) {
-        delete process.env.OPENCLAW_LOCALE;
-      } else {
-        process.env.OPENCLAW_LOCALE = previousLocale;
-      }
-    }
+    });
 
     expect(note).toHaveBeenCalledWith(expect.stringContaining("在线查询资料"), "网页搜索");
     expect(select).toHaveBeenCalledWith(
@@ -203,7 +229,7 @@ describe("runSearchSetupFlow", () => {
       .fn()
       .mockResolvedValueOnce("grok")
       .mockResolvedValueOnce("yes")
-      .mockResolvedValueOnce("grok-4-1-fast");
+      .mockResolvedValueOnce("grok-4.3");
     const text = vi.fn().mockResolvedValue("xai-test-key");
     const prompter = createWizardPrompter({
       select: select as never,
@@ -223,7 +249,101 @@ describe("runSearchSetupFlow", () => {
     expect(next.tools?.web?.search?.provider).toBe("grok");
     expect(next.tools?.web?.search?.enabled).toBe(true);
     expect(xaiConfig?.xSearch?.enabled).toBe(true);
-    expect(xaiConfig?.xSearch?.model).toBe("grok-4-1-fast");
+    expect(xaiConfig?.xSearch?.model).toBe("grok-4.3");
+  });
+
+  it("shows provider notes in every search provider row label", async () => {
+    const select = vi.fn().mockResolvedValueOnce("__skip__");
+    const prompter = createWizardPrompter({
+      select: select as never,
+    });
+
+    await runSearchSetupFlow({ plugins: { allow: ["xai"] } }, createNonExitingRuntime(), prompter);
+
+    const options = select.mock.calls[0]?.[0]?.options as
+      | Array<{ value: string; label?: string; hint?: string }>
+      | undefined;
+    const grokOption = options?.find((option) => option.value === "grok");
+
+    expect(grokOption).toEqual(
+      expect.objectContaining({
+        label: "Grok (Search with xAI · xAI API key required)",
+      }),
+    );
+    expect(grokOption).not.toHaveProperty("hint");
+  });
+
+  it("recommends Codex hosted search first when the configured model uses Codex", async () => {
+    webSearchProviderMocks.resolvePluginWebSearchProviders.mockReturnValue([
+      mockGrokProvider,
+      mockCodexProvider,
+    ]);
+    const select = vi.fn().mockResolvedValueOnce("__skip__");
+    const prompter = createWizardPrompter({
+      select: select as never,
+    });
+
+    await runSearchSetupFlow(
+      {
+        agents: {
+          defaults: {
+            model: {
+              primary: "openai/gpt-5.5",
+            },
+          },
+        },
+      },
+      createNonExitingRuntime(),
+      prompter,
+    );
+
+    const prompt = select.mock.calls[0]?.[0] as
+      | {
+          options?: Array<{ value: string; label?: string }>;
+          initialValue?: string;
+        }
+      | undefined;
+    expect(prompt?.options?.[0]).toEqual(
+      expect.objectContaining({
+        value: "codex",
+        label: expect.stringContaining("Codex Hosted Search"),
+      }),
+    );
+    expect(prompt?.initialValue).toBe("codex");
+  });
+
+  it("uses existing xAI OAuth for Grok web search without prompting for an API key", async () => {
+    authMocks.hasAuthProfileForProvider.mockImplementation(
+      ({ provider, type }) => provider === "xai" && (!type || type === "oauth"),
+    );
+    const select = vi.fn().mockResolvedValueOnce("grok").mockResolvedValueOnce("no");
+    const text = vi.fn(async () => {
+      throw new Error("API key prompt should not run when xAI OAuth is available");
+    });
+    const note = vi.fn(async () => {});
+    const prompter = createWizardPrompter({
+      note: note as never,
+      select: select as never,
+      text: text as never,
+    });
+
+    const next = await runSearchSetupFlow(
+      { plugins: { allow: ["xai"] } },
+      createNonExitingRuntime(),
+      prompter,
+    );
+
+    const xaiConfig = next.plugins?.entries?.xai?.config as
+      | { webSearch?: { apiKey?: string } }
+      | undefined;
+    expect(next.tools?.web?.search?.provider).toBe("grok");
+    expect(next.tools?.web?.search?.enabled).toBe(true);
+    expect(xaiConfig?.webSearch?.apiKey).toBeUndefined();
+    expect(text).not.toHaveBeenCalled();
+    expect(note).toHaveBeenCalledWith(
+      expect.stringContaining("existing xAI OAuth sign-in"),
+      "Web search",
+    );
   });
 
   it("shows provider credential notes before plaintext credential prompts", async () => {
@@ -240,7 +360,12 @@ describe("runSearchSetupFlow", () => {
 
     expect(note).toHaveBeenCalledWith(mockGrokProvider.credentialNote, mockGrokProvider.label);
     expect(text).toHaveBeenCalledTimes(1);
-    expect(note.mock.invocationCallOrder[1]).toBeLessThan(text.mock.invocationCallOrder[0]);
+    expect(note.mock.invocationCallOrder[1]).toBeLessThan(
+      expectDefined(
+        text.mock.invocationCallOrder[0],
+        "text.mock.invocationCallOrder[0] test invariant",
+      ),
+    );
   });
 
   it("shows provider credential notes before SecretRef setup notes", async () => {
@@ -316,7 +441,7 @@ describe("runSearchSetupFlow", () => {
       .fn()
       .mockResolvedValueOnce("grok")
       .mockResolvedValueOnce("yes")
-      .mockResolvedValueOnce("grok-4-1-fast");
+      .mockResolvedValueOnce("grok-4.3");
     const prompter = createWizardPrompter({
       select: select as never,
     });
@@ -355,7 +480,47 @@ describe("runSearchSetupFlow", () => {
     expect(next.tools?.web?.search?.provider).toBe("grok");
     expect(next.tools?.web?.search?.enabled).toBe(false);
     expect(xaiConfig?.xSearch?.enabled).toBe(true);
-    expect(xaiConfig?.xSearch?.model).toBe("grok-4-1-fast");
+    expect(xaiConfig?.xSearch?.model).toBe("grok-4.3");
+  });
+
+  it("allows an explicit setup flow to reenable credential-ready web_search", async () => {
+    const select = vi.fn().mockResolvedValueOnce("grok").mockResolvedValueOnce("no");
+    const prompter = createWizardPrompter({
+      select: select as never,
+    });
+
+    const next = await runSearchSetupFlow(
+      {
+        plugins: {
+          allow: ["xai"],
+          entries: {
+            xai: {
+              config: {
+                webSearch: {
+                  apiKey: "xai-test-key",
+                },
+              },
+            },
+          },
+        },
+        tools: {
+          web: {
+            search: {
+              enabled: false,
+              provider: "grok",
+            },
+          },
+        },
+      },
+      createNonExitingRuntime(),
+      prompter,
+      { preserveDisabledSearchState: false },
+    );
+
+    expect(next.tools?.web?.search).toMatchObject({
+      enabled: true,
+      provider: "grok",
+    });
   });
 
   it("installs an external catalog search provider before enabling it", async () => {

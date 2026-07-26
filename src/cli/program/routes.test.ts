@@ -1,3 +1,4 @@
+// Program route tests cover CLI route table registration and dispatch.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { defaultRuntime } from "../../runtime.js";
 import { findRoutedCommand } from "./routes.js";
@@ -53,7 +54,7 @@ vi.mock("../../commands/channels/status.js", () => ({
   channelsStatusCommand: channelsStatusCommandMock,
 }));
 
-vi.mock("../../commands/agents.js", () => ({
+vi.mock("../../commands/agents.commands.list.js", () => ({
   agentsListCommand: agentsListCommandMock,
 }));
 
@@ -283,6 +284,22 @@ describe("program routes", () => {
     await expectRunFalse(["status"], ["node", "openclaw", "status", "--timeout"]);
   });
 
+  it.each([
+    { path: ["health"], argv: ["node", "openclaw", "health", "--wat"] },
+    { path: ["status"], argv: ["node", "openclaw", "status", "--wat"] },
+    { path: ["sessions"], argv: ["node", "openclaw", "sessions", "--wat"] },
+    {
+      path: ["agents", "list"],
+      argv: ["node", "openclaw", "agents", "list", "--wat"],
+    },
+    { path: ["agents"], argv: ["node", "openclaw", "agents", "--wat"] },
+  ])(
+    "returns false instead of handling unknown routed option for $path",
+    async ({ path, argv }) => {
+      await expectRunFalse(path, argv);
+    },
+  );
+
   it("routes status --json through the lean JSON command", async () => {
     const route = expectRoute(["status"]);
     await expect(
@@ -344,7 +361,14 @@ describe("program routes", () => {
     await expect(
       route.run(["node", "openclaw", "--profile", "work", "config", "unset", "update.channel"]),
     ).resolves.toBe(true);
-    expect(runConfigUnsetMock).toHaveBeenCalledWith({ path: "update.channel" });
+    expect(runConfigUnsetMock).toHaveBeenCalledWith({
+      path: "update.channel",
+      cliOptions: {
+        dryRun: false,
+        allowExec: false,
+        json: false,
+      },
+    });
   });
 
   it("passes config get path when root value options appear after subcommand", async () => {
@@ -369,7 +393,38 @@ describe("program routes", () => {
     await expect(
       route.run(["node", "openclaw", "config", "unset", "--profile", "work", "update.channel"]),
     ).resolves.toBe(true);
-    expect(runConfigUnsetMock).toHaveBeenCalledWith({ path: "update.channel" });
+    expect(runConfigUnsetMock).toHaveBeenCalledWith({
+      path: "update.channel",
+      cliOptions: {
+        dryRun: false,
+        allowExec: false,
+        json: false,
+      },
+    });
+  });
+
+  it("passes config unset dry-run options", async () => {
+    const route = expectRoute(["config", "unset"]);
+    await expect(
+      route.run([
+        "node",
+        "openclaw",
+        "config",
+        "unset",
+        "--dry-run",
+        "--json",
+        "--allow-exec",
+        "update.channel",
+      ]),
+    ).resolves.toBe(true);
+    expect(runConfigUnsetMock).toHaveBeenCalledWith({
+      path: "update.channel",
+      cliOptions: {
+        dryRun: true,
+        allowExec: true,
+        json: true,
+      },
+    });
   });
 
   it("returns false for config get route when unknown option appears", async () => {
@@ -481,6 +536,24 @@ describe("program routes", () => {
       { json: true, runtime: "cron", status: undefined },
       defaultRuntime,
     );
+
+    await expect(
+      listRoute.run([
+        "node",
+        "openclaw",
+        "tasks",
+        "list",
+        "--json",
+        "--runtime",
+        "   ",
+        "--status",
+        "\t",
+      ]),
+    ).resolves.toBe(true);
+    expect(tasksListJsonCommandMock).toHaveBeenLastCalledWith(
+      { json: true, runtime: "   ", status: "\t" },
+      defaultRuntime,
+    );
   });
 
   it("routes parent task filter values that command-path discovery sees as positionals", async () => {
@@ -545,6 +618,24 @@ describe("program routes", () => {
       { json: true, severity: "error", code: "stale_running", limit: 5 },
       defaultRuntime,
     );
+
+    await expect(
+      route.run([
+        "node",
+        "openclaw",
+        "tasks",
+        "audit",
+        "--json",
+        "--severity",
+        "  ",
+        "--code",
+        "\t",
+      ]),
+    ).resolves.toBe(true);
+    expect(tasksAuditJsonCommandMock).toHaveBeenLastCalledWith(
+      { json: true, severity: "  ", code: "\t", limit: undefined },
+      defaultRuntime,
+    );
   });
 
   it("returns false for task JSON routes when option values are missing or unknown", async () => {
@@ -553,6 +644,10 @@ describe("program routes", () => {
     await expectRunFalse(
       ["tasks", "audit"],
       ["node", "openclaw", "tasks", "audit", "--json", "--limit"],
+    );
+    await expectRunFalse(
+      ["tasks", "audit"],
+      ["node", "openclaw", "tasks", "audit", "--json", "--limit", "5abc"],
     );
     await expectRunFalse(
       ["tasks", "audit"],

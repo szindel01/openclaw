@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+// Builds dependency change reports from lockfile and manifest diffs.
 import { execFileSync } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -10,11 +11,21 @@ import {
 } from "./pre-commit/pnpm-audit-prod.mjs";
 
 const DEPENDENCY_FILE_PATTERNS = [
+  /^\.github\/release\/clawhub-cli\/package-lock\.json$/u,
   /^package\.json$/u,
   /^pnpm-lock\.yaml$/u,
   /^pnpm-workspace\.yaml$/u,
   /^patches\//u,
   /\/package\.json$/u,
+];
+
+const DEPENDENCY_DIFF_PATHS = [
+  ".github/release/clawhub-cli/package-lock.json",
+  "package.json",
+  "pnpm-lock.yaml",
+  "pnpm-workspace.yaml",
+  "*package.json",
+  "patches",
 ];
 
 function payloadFromLockfile(lockfileText) {
@@ -25,6 +36,9 @@ function versionsFor(payload, packageName) {
   return new Set(payload[packageName] ?? []);
 }
 
+/**
+ * Creates a structured dependency diff report from base/head payloads.
+ */
 export function createDependencyChangesReport({
   basePayload,
   headPayload,
@@ -108,7 +122,7 @@ function renderMarkdownReport(report) {
     "",
     "It reports two related but different things:",
     "",
-    "- Dependency file changes: package manifests, pnpm workspace config, lockfile, and patches.",
+    "- Dependency file changes: package manifests, pnpm workspace config, pnpm lockfile, the trusted ClawHub CLI package lock, and patches.",
     "- Resolved package changes: package versions added, removed, or changed in pnpm-lock.yaml.",
     "",
     "## Summary",
@@ -168,24 +182,24 @@ function readGitFile(ref, filePath, cwd) {
   });
 }
 
-function isDependencyFile(filePath) {
+/**
+ * Reports whether a path is a dependency-related file.
+ */
+export function isDependencyFile(filePath) {
   return DEPENDENCY_FILE_PATTERNS.some((pattern) => pattern.test(filePath));
+}
+
+/**
+ * Returns git pathspecs used for dependency diff collection.
+ */
+export function dependencyDiffPathspecs() {
+  return [...DEPENDENCY_DIFF_PATHS];
 }
 
 function gitDiffDependencyFiles(baseRef, cwd) {
   const output = execFileSync(
     "git",
-    [
-      "diff",
-      "--name-status",
-      baseRef,
-      "--",
-      "package.json",
-      "pnpm-lock.yaml",
-      "pnpm-workspace.yaml",
-      "*package.json",
-      "patches",
-    ],
+    ["diff", "--name-status", baseRef, "--", ...DEPENDENCY_DIFF_PATHS],
     {
       cwd,
       encoding: "utf8",
@@ -212,7 +226,15 @@ function gitDiffDependencyFiles(baseRef, cwd) {
     });
 }
 
-function parseArgs(argv) {
+function readRequiredValue(argv, index, flag) {
+  const value = argv[index + 1];
+  if (!value || value.startsWith("-")) {
+    throw new Error(`${flag} requires a value`);
+  }
+  return value;
+}
+
+export function parseArgs(argv) {
   const options = {
     rootDir: process.cwd(),
     baseRef: null,
@@ -221,39 +243,56 @@ function parseArgs(argv) {
     jsonPath: null,
     markdownPath: null,
   };
+  const seen = new Set();
+  const setOnce = (flag, key, value) => {
+    if (seen.has(flag)) {
+      throw new Error(`${flag} was provided more than once.`);
+    }
+    seen.add(flag);
+    options[key] = value;
+  };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--") {
       continue;
     }
     if (arg === "--root") {
-      options.rootDir = argv[++index];
+      setOnce(arg, "rootDir", readRequiredValue(argv, index, "--root"));
+      index += 1;
       continue;
     }
     if (arg === "--base-ref") {
-      options.baseRef = argv[++index];
+      setOnce(arg, "baseRef", readRequiredValue(argv, index, "--base-ref"));
+      index += 1;
       continue;
     }
     if (arg === "--base-lockfile") {
-      options.baseLockfile = argv[++index];
+      setOnce(arg, "baseLockfile", readRequiredValue(argv, index, "--base-lockfile"));
+      index += 1;
       continue;
     }
     if (arg === "--head-lockfile") {
-      options.headLockfile = argv[++index];
+      setOnce(arg, "headLockfile", readRequiredValue(argv, index, "--head-lockfile"));
+      index += 1;
       continue;
     }
     if (arg === "--json") {
-      options.jsonPath = argv[++index];
+      setOnce(arg, "jsonPath", readRequiredValue(argv, index, "--json"));
+      index += 1;
       continue;
     }
     if (arg === "--markdown") {
-      options.markdownPath = argv[++index];
+      setOnce(arg, "markdownPath", readRequiredValue(argv, index, "--markdown"));
+      index += 1;
       continue;
     }
     throw new Error(`Unsupported argument: ${arg}`);
   }
   if (!options.baseRef && !options.baseLockfile) {
     throw new Error("Expected --base-ref <git-ref> or --base-lockfile <path>.");
+  }
+  if (options.baseRef && options.baseLockfile) {
+    throw new Error("Use either --base-ref or --base-lockfile, not both.");
   }
   return options;
 }
@@ -266,7 +305,10 @@ async function writeArtifact(filePath, content) {
   await writeFile(filePath, content, "utf8");
 }
 
-export async function runDependencyChangesReport(options) {
+/**
+ * Generates and writes dependency change report artifacts.
+ */
+async function runDependencyChangesReport(options) {
   const headLockfileText = await readFile(path.join(options.rootDir, options.headLockfile), "utf8");
   const baseLockfileText = options.baseRef
     ? readGitFile(options.baseRef, "pnpm-lock.yaml", options.rootDir)
@@ -283,13 +325,16 @@ export async function runDependencyChangesReport(options) {
   });
 }
 
+/**
+ * Runs the dependency changes report CLI.
+ */
 export async function main(argv = process.argv.slice(2)) {
   const options = parseArgs(argv);
   const report = await runDependencyChangesReport(options);
   await writeArtifact(options.jsonPath, `${JSON.stringify(report, null, 2)}\n`);
   await writeArtifact(options.markdownPath, renderMarkdownReport(report));
   const artifactHint =
-    typeof options.markdownPath === "string" ? " See " + options.markdownPath + "." : "";
+    typeof options.markdownPath === "string" ? " See ".concat(options.markdownPath, ".") : "";
   process.stdout.write(
     `INFO dependency change report: ${report.summary.addedPackages} added, ` +
       `${report.summary.removedPackages} removed, ${report.summary.changedPackages} changed ` +
@@ -304,8 +349,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(import.met
     (exitCode) => {
       process.exitCode = exitCode;
     },
-    (error) => {
-      process.stderr.write(`${error.stack ?? error.message ?? String(error)}\n`);
+    /** @param {unknown} error */ (error) => {
+      process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
       process.exitCode = 1;
     },
   );

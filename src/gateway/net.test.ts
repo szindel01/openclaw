@@ -1,11 +1,14 @@
+// Gateway net tests cover bind-host selection, loopback/private host detection,
+// trusted proxy IP resolution, container defaults, and interface matching.
+import net from "node:net";
 import os from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resetContainerEnvironmentCacheForTest } from "../infra/container-environment.js";
 import { makeNetworkInterfacesSnapshot } from "../test-helpers/network-interfaces.js";
+import { captureEnv, deleteTestEnvValue, setTestEnvValue } from "../test-utils/env.js";
 import {
-  __resetContainerCacheForTest,
   defaultGatewayBindMode,
   isContainerEnvironment,
-  isLocalInterfaceAddress,
   isLocalishHost,
   isLoopbackHost,
   isPrivateOrLoopbackAddress,
@@ -23,22 +26,12 @@ import {
 const flyMachineEnvKeys = ["FLY_MACHINE_ID", "FLY_APP_NAME"] as const;
 
 function clearFlyMachineEnvForTest(): () => void {
-  const previousEnv = new Map<(typeof flyMachineEnvKeys)[number], string | undefined>();
+  const envSnapshot = captureEnv([...flyMachineEnvKeys]);
   for (const key of flyMachineEnvKeys) {
-    previousEnv.set(key, process.env[key]);
-    delete process.env[key];
+    deleteTestEnvValue(key);
   }
 
-  return () => {
-    for (const key of flyMachineEnvKeys) {
-      const value = previousEnv.get(key);
-      if (value === undefined) {
-        delete process.env[key];
-      } else {
-        process.env[key] = value;
-      }
-    }
-  };
+  return () => envSnapshot.restore();
 }
 
 function useClearedFlyMachineEnv() {
@@ -240,7 +233,7 @@ describe("isTrustedProxyAddress", () => {
   });
 });
 
-describe("isLocalInterfaceAddress", () => {
+describe("resolveLocalInterfaceAddressMatch", () => {
   const snapshot = makeNetworkInterfacesSnapshot({
     lo: [
       { address: "127.0.0.1", family: "IPv4", internal: true },
@@ -258,11 +251,7 @@ describe("isLocalInterfaceAddress", () => {
     { input: "10.42.0.60", expected: false },
     { input: undefined, expected: false },
   ] as const)("returns $expected for $input", ({ input, expected }) => {
-    expect(isLocalInterfaceAddress(input, snapshot)).toBe(expected);
-  });
-
-  it("returns false when interface discovery is unavailable", () => {
-    expect(isLocalInterfaceAddress("10.42.0.59", undefined)).toBe(false);
+    expect(resolveLocalInterfaceAddressMatch(input, snapshot)).toBe(expected);
   });
 
   it("reports an indeterminate match when interface discovery is unavailable", () => {
@@ -370,6 +359,22 @@ describe("resolveGatewayListenHosts", () => {
       expected: ["0.0.0.0"],
     },
     {
+      name: "IPv6 host passthrough",
+      host: "::1",
+      canBindToHost: async () => {
+        throw new Error("should not be called");
+      },
+      expected: ["::1"],
+    },
+    {
+      name: "specific non-loopback host with loopback alias available",
+      host: "100.64.0.1",
+      canBindToHost: async () => {
+        throw new Error("should not be called");
+      },
+      expected: ["100.64.0.1", "127.0.0.1"],
+    },
+    {
       name: "loopback with IPv6 available",
       host: "127.0.0.1",
       canBindToHost: async () => true,
@@ -394,6 +399,14 @@ describe("resolveGatewayListenHosts", () => {
     const canBindToHost = vi.fn().mockResolvedValue(true);
     const hosts = await resolveGatewayListenHosts("127.0.0.1", { canBindToHost });
     expect(hosts).toEqual(["127.0.0.1"]);
+    expect(canBindToHost).not.toHaveBeenCalled();
+  });
+
+  it("still adds the IPv4 loopback alias for a specific host on Windows", async () => {
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    const canBindToHost = vi.fn().mockResolvedValue(true);
+    const hosts = await resolveGatewayListenHosts("100.64.0.1", { canBindToHost });
+    expect(hosts).toEqual(["100.64.0.1", "127.0.0.1"]);
     expect(canBindToHost).not.toHaveBeenCalled();
   });
 
@@ -551,7 +564,7 @@ describe("isContainerEnvironment", () => {
   useClearedFlyMachineEnv();
 
   afterEach(() => {
-    __resetContainerCacheForTest();
+    resetContainerEnvironmentCacheForTest();
     vi.restoreAllMocks();
   });
 
@@ -590,8 +603,8 @@ describe("isContainerEnvironment", () => {
     });
     vi.spyOn(fs, "readFileSync").mockReturnValue("10:cpuset:/\n9:perf_event:/\n8:memory:/\n0::/\n");
 
-    process.env.FLY_MACHINE_ID = "3d8d5459a03038";
-    process.env.FLY_APP_NAME = "openclaw-test";
+    setTestEnvValue("FLY_MACHINE_ID", "3d8d5459a03038");
+    setTestEnvValue("FLY_APP_NAME", "openclaw-test");
     expect(isContainerEnvironment()).toBe(true);
   });
 
@@ -669,12 +682,14 @@ describe("resolveGatewayBindHost", () => {
   useClearedFlyMachineEnv();
 
   afterEach(() => {
-    __resetContainerCacheForTest();
+    resetContainerEnvironmentCacheForTest();
     vi.restoreAllMocks();
   });
 
   it("returns 127.0.0.1 for loopback mode", async () => {
+    const createServerSpy = vi.spyOn(net, "createServer");
     expect(await resolveGatewayBindHost("loopback")).toBe("127.0.0.1");
+    expect(createServerSpy).not.toHaveBeenCalled();
   });
 
   it("returns 0.0.0.0 for lan mode", async () => {
@@ -710,7 +725,7 @@ describe("defaultGatewayBindMode", () => {
   useClearedFlyMachineEnv();
 
   afterEach(() => {
-    __resetContainerCacheForTest();
+    resetContainerEnvironmentCacheForTest();
     vi.restoreAllMocks();
   });
 
@@ -760,17 +775,19 @@ describe("isSecureWebSocketUrl", () => {
     { input: "ws://localhost:18789", expected: true },
     { input: "ws://[::1]:18789", expected: true },
     { input: "ws://127.0.0.42:18789", expected: true },
-    // ws:// private/public remote addresses rejected by default
-    { input: "ws://10.0.0.5:18789", expected: false },
-    { input: "ws://10.42.1.100:18789", expected: false },
-    { input: "ws://172.16.0.1:18789", expected: false },
-    { input: "ws://172.31.255.254:18789", expected: false },
-    { input: "ws://192.168.1.100:18789", expected: false },
-    { input: "ws://169.254.10.20:18789", expected: false },
-    { input: "ws://100.64.0.1:18789", expected: false },
-    { input: "ws://[fc00::1]:18789", expected: false },
-    { input: "ws://[fd12:3456:789a::1]:18789", expected: false },
-    { input: "ws://[fe80::1]:18789", expected: false },
+    // ws:// trusted LAN/Tailnet endpoints accepted
+    { input: "ws://10.0.0.5:18789", expected: true },
+    { input: "ws://10.42.1.100:18789", expected: true },
+    { input: "ws://172.16.0.1:18789", expected: true },
+    { input: "ws://172.31.255.254:18789", expected: true },
+    { input: "ws://192.168.1.100:18789", expected: true },
+    { input: "ws://169.254.10.20:18789", expected: true },
+    { input: "ws://100.64.0.1:18789", expected: true },
+    { input: "ws://[fc00::1]:18789", expected: true },
+    { input: "ws://[fd12:3456:789a::1]:18789", expected: true },
+    { input: "ws://[fe80::1]:18789", expected: true },
+    { input: "ws://gateway.local:18789", expected: true },
+    { input: "ws://machine.tail123.ts.net:18789", expected: true },
     { input: "ws://[::]:18789", expected: false },
     { input: "ws://[ff02::1]:18789", expected: false },
     // ws:// public addresses rejected
@@ -789,20 +806,11 @@ describe("isSecureWebSocketUrl", () => {
     expect(isSecureWebSocketUrl(input), input).toBe(expected);
   });
 
-  it("allows private ws:// only when opt-in is enabled", () => {
-    const allowedWhenOptedIn = [
-      "ws://10.0.0.5:18789",
-      "http://10.0.0.5:18789",
-      "ws://172.16.0.1:18789",
-      "ws://192.168.1.100:18789",
-      "ws://100.64.0.1:18789",
-      "ws://169.254.10.20:18789",
-      "ws://[fc00::1]:18789",
-      "ws://[fe80::1]:18789",
-      "ws://gateway.private.example:18789",
-    ];
+  it("allows arbitrary private-dns ws:// hostnames only when opt-in is enabled", () => {
+    const allowedWhenOptedIn = ["ws://gateway.private.example:18789"];
 
     for (const input of allowedWhenOptedIn) {
+      expect(isSecureWebSocketUrl(input), input).toBe(false);
       expect(isSecureWebSocketUrl(input, { allowPrivateWs: true }), input).toBe(true);
     }
   });

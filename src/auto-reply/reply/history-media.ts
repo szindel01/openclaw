@@ -1,10 +1,13 @@
-import { mimeTypeFromFilePath } from "../../media/mime.js";
-import { normalizeOptionalString } from "../../shared/string-coerce.js";
-import type { FinalizedMsgContext } from "../templating.js";
+// Extracts media attachment references from reply history entries.
+import { mimeTypeFromFilePath } from "@openclaw/media-core/mime";
+import { expectDefined } from "@openclaw/normalization-core";
+import { asFiniteNumber } from "@openclaw/normalization-core/number-coercion";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import type { MsgContext } from "../templating.js";
 import type { HistoryEntry, HistoryMediaEntry } from "./history.types.js";
 
-export const RECENT_HISTORY_IMAGE_TTL_MS = 30 * 60_000;
-export const RECENT_HISTORY_IMAGE_LIMIT = 4;
+const RECENT_HISTORY_IMAGE_TTL_MS = 30 * 60_000;
+const RECENT_HISTORY_IMAGE_LIMIT = 4;
 
 export type RecentInboundHistoryImage = {
   path: string;
@@ -41,15 +44,15 @@ function isHistoryImageMedia(media: HistoryMediaEntry): boolean {
 }
 
 function resolveTimestamp(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  return asFiniteNumber(value);
 }
 
-function resolveHistoryEntries(ctx: FinalizedMsgContext): HistoryEntry[] {
+function resolveHistoryEntries(ctx: MsgContext): HistoryEntry[] {
   return Array.isArray(ctx.InboundHistory) ? ctx.InboundHistory : [];
 }
 
 export function resolveRecentInboundHistoryImages(params: {
-  ctx: FinalizedMsgContext;
+  ctx: MsgContext;
   nowMs?: number;
   ttlMs?: number;
   limit?: number;
@@ -65,7 +68,7 @@ export function resolveRecentInboundHistoryImages(params: {
   const seen = new Set<string>();
   const entries = resolveHistoryEntries(params.ctx);
   for (let index = entries.length - 1; index >= 0 && out.length < limit; index -= 1) {
-    const entry = entries[index];
+    const entry = expectDefined(entries[index], "entries entry at index");
     const timestamp = resolveTimestamp(entry?.timestamp);
     if (timestamp === undefined || Math.abs(nowMs - timestamp) > ttlMs) {
       continue;

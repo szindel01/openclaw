@@ -1,3 +1,4 @@
+// Message command tests cover CLI message sending, environment handling, and runtime dependency wiring.
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CliDeps } from "../cli/deps.js";
 import type { RuntimeEnv } from "../runtime.js";
@@ -9,6 +10,7 @@ type RunMessageActionParams = {
   params: Record<string, unknown>;
   agentId?: string;
   senderIsOwner?: boolean;
+  conversationReadOrigin?: "delegated" | "direct-operator";
   gateway?: {
     clientName?: string;
     mode?: string;
@@ -205,6 +207,7 @@ describe("messageCommand", () => {
     expect(actionCall.params.message).toBe("hi");
     expect(actionCall.agentId).toBe("main");
     expect(actionCall.senderIsOwner).toBe(true);
+    expect(actionCall.conversationReadOrigin).toBe("direct-operator");
     expect(actionCall.gateway?.clientName).toBe("cli");
     expect(actionCall.gateway?.mode).toBe("cli");
     expect(actionCall.cfg).not.toBe(rawConfig);
@@ -298,6 +301,40 @@ describe("messageCommand", () => {
     expect(actionCall.params.channel).toBe("telegram");
     expect(actionCall.params.target).toBe("123456789");
     expect(actionCall.params.pollQuestion).toBe("Ship it?");
+  });
+
+  it("includes a stable top-level messageId in JSON output", async () => {
+    runMessageActionMock.mockResolvedValueOnce({
+      kind: "send",
+      channel: "discord",
+      action: "send",
+      to: "channel:general",
+      handledBy: "plugin",
+      payload: {
+        ok: true,
+        result: {
+          messageId: "msg-json-1",
+          channelId: "general",
+        },
+      } as { ok: boolean } & Record<string, unknown>,
+      dryRun: false,
+    });
+
+    await runMessageCommand({
+      channel: "discord",
+      target: "channel:general",
+    });
+
+    const output = vi.mocked(runtime.log).mock.calls[0]?.[0];
+    const json = JSON.parse(String(output)) as { messageId?: string; payload?: unknown };
+    expect(json.messageId).toBe("msg-json-1");
+    expect(json.payload).toEqual({
+      ok: true,
+      result: {
+        messageId: "msg-json-1",
+        channelId: "general",
+      },
+    });
   });
 
   it("rejects unknown message actions before dispatch", async () => {
