@@ -1,7 +1,0 @@
-FROM openclaw:chromium
-
-# Installer les outils manquants
-RUN apt-get update && \
-    apt-get install -y jq curl && \
-    rm -rf /var/lib/apt/lists/*
-
