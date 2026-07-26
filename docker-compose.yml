@@ -10,6 +10,12 @@ services:
       CLAUDE_WEB_SESSION_KEY: ${CLAUDE_WEB_SESSION_KEY:-}
       CLAUDE_WEB_COOKIE: ${CLAUDE_WEB_COOKIE:-}
       TZ: ${OPENCLAW_TZ:-UTC}
+      NOTION_API_TOKEN: ${NOTION_API_TOKEN:-}
+      GH_TOKEN: ${GH_TOKEN:-}
+      N8N_API_KEY: ${N8N_API_KEY:-}
+      GOOGLE_SEARCH_API_KEY: ${GOOGLE_SEARCH_API_KEY:-}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
     volumes:
       - /root/init-tools.sh:/docker-entrypoint-initdb.d/init-tools.sh:ro
       - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
