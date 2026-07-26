@@ -167,7 +167,11 @@ mantis/
 /local/
 /client_secret_*.json
 package-lock.json
-.claude/
+.claude/*
+!.claude/skills/
+!.claude/skills/**
+!.claude/CLAUDE.md
+!.claude/settings.json
 .agent/
 skills-lock.json
 
